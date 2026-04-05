@@ -32,6 +32,7 @@ FEATURE_COLUMNS = [
     "Open", "High", "Low", "Close", "Volume",
     "RSI", "MACD", "ATR", "Bollinger_Width", "SMA_50", "EMA_20",
     "Oil", "SP500", "Gold", "DXY", "Interest_Rate",
+    "Sentiment_Score", "Sentiment_Confidence", "Sentiment_Encoded",
 ]
 
 TARGET_COLUMN = "Close"
@@ -56,6 +57,38 @@ class ModelTrainer:
         self.epochs = epochs
         self.batch_size = batch_size
 
+    @staticmethod
+    def _merge_sentiment(df: pd.DataFrame) -> pd.DataFrame:
+        """Merge sentiment data from Supabase into the main DataFrame."""
+        try:
+            from db.supabase_client import get_sentiment
+            sent_df = get_sentiment("TASI")
+            if not sent_df.empty:
+                sent_df = sent_df.rename(columns={
+                    "date": "Date",
+                    "sentiment_score": "Sentiment_Score",
+                    "confidence": "Sentiment_Confidence",
+                    "sentiment_encoded": "Sentiment_Encoded",
+                })
+                sent_df = sent_df[["Date", "Sentiment_Score", "Sentiment_Confidence",
+                                   "Sentiment_Encoded"]]
+                df = pd.merge(df, sent_df, on="Date", how="left")
+                filled = df["Sentiment_Score"].notna().sum()
+                print(f"[INFO] Merged {filled} days of sentiment data from Supabase")
+            else:
+                print("[INFO] No sentiment data in Supabase — using neutral defaults")
+        except Exception as e:
+            print(f"[WARN] Could not load sentiment from Supabase: {e}")
+
+        # Fill missing sentiment with neutral defaults
+        for col, default in [("Sentiment_Score", 0), ("Sentiment_Confidence", 0),
+                             ("Sentiment_Encoded", 0)]:
+            if col not in df.columns:
+                df[col] = default
+            else:
+                df[col] = df[col].ffill().fillna(default)
+        return df
+
     def run(self) -> None:
         # ---- 1. Data acquisition ----
         print("=" * 60)
@@ -63,6 +96,12 @@ class ModelTrainer:
         print("=" * 60)
         das = DataAcquisitionService(csv_path=self.csv_path)
         df = das.load_all()
+
+        # ---- 1b. Merge sentiment data ----
+        print("\n" + "=" * 60)
+        print("STEP 1b: Merging sentiment data")
+        print("=" * 60)
+        df = self._merge_sentiment(df)
 
         # ---- 2. Technical indicators ----
         print("\n" + "=" * 60)

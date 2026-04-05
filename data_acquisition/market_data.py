@@ -150,15 +150,113 @@ class DataAcquisitionService:
         return macro
 
     # ------------------------------------------------------------------
+    # Live TASI data from yfinance
+    # ------------------------------------------------------------------
+
+    TASI_TICKER = "^TASI.SR"
+
+    def fetch_tasi_live(self, start: str = "2008-10-01") -> pd.DataFrame:
+        """Fetch TASI OHLCV data directly from yfinance (no CSV needed).
+
+        Returns DataFrame with columns: Date, Open, High, Low, Close, Volume
+        """
+        print(f"[INFO] Fetching TASI data from yfinance ({self.TASI_TICKER})...")
+        data = yf.download(self.TASI_TICKER, start=start, progress=False)
+        if data.empty:
+            raise RuntimeError("Could not fetch TASI data from yfinance")
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        df = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.index.name = "Date"
+        df.reset_index(inplace=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        print(f"[INFO] Fetched {len(df)} trading days from yfinance "
+              f"({df['Date'].min().date()} to {df['Date'].max().date()})")
+        return df
+
+    # ------------------------------------------------------------------
+    # Supabase data loading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_from_supabase() -> pd.DataFrame:
+        """Load TASI OHLCV data from Supabase market_data table."""
+        from db.supabase_client import get_market_data
+        df = get_market_data("TASI")
+        if df.empty:
+            raise RuntimeError("No TASI data in Supabase market_data table")
+        df = df.rename(columns={
+            "date": "Date", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume",
+        })
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        print(f"[INFO] Loaded {len(df)} trading days from Supabase "
+              f"({df['Date'].min().date()} to {df['Date'].max().date()})")
+        return df
+
+    def update_supabase(self) -> pd.DataFrame:
+        """Fetch latest TASI data from yfinance and upsert into Supabase.
+
+        Returns the full up-to-date DataFrame.
+        """
+        from db.supabase_client import get_market_data, upsert_market_data
+
+        # Check what's already in Supabase
+        existing = get_market_data("TASI")
+        if not existing.empty:
+            last_date = existing["date"].max().strftime("%Y-%m-%d")
+            print(f"[INFO] Supabase has data up to {last_date}")
+            # Fetch only new data (from last date onward to catch updates)
+            new_data = yf.download(self.TASI_TICKER, start=last_date, progress=False)
+        else:
+            print("[INFO] Supabase is empty — fetching full TASI history")
+            new_data = yf.download(self.TASI_TICKER, start="2008-10-01", progress=False)
+
+        if new_data.empty:
+            print("[INFO] No new TASI data from yfinance")
+        else:
+            if isinstance(new_data.columns, pd.MultiIndex):
+                new_data.columns = new_data.columns.get_level_values(0)
+            new_df = new_data[["Open", "High", "Low", "Close", "Volume"]].copy()
+            new_df.index.name = "Date"
+            new_df.reset_index(inplace=True)
+            new_df["Date"] = pd.to_datetime(new_df["Date"])
+            count = upsert_market_data(new_df, symbol="TASI")
+            print(f"[INFO] Upserted {count} rows into Supabase market_data")
+
+        # Return the full dataset from Supabase
+        return self.load_from_supabase()
+
+    # ------------------------------------------------------------------
     # Merge
     # ------------------------------------------------------------------
 
-    def load_all(self) -> pd.DataFrame:
+    def load_all(self, source: str = "csv") -> pd.DataFrame:
         """Load TASI data, fetch macro, and merge them by date.
+
+        Parameters
+        ----------
+        source : str — 'csv' (from CSV file), 'api' (from yfinance),
+                       'supabase' (from DB), or 'auto' (Supabase + update from API)
 
         Macro data is forward-filled to align with TASI trading days.
         """
-        tasi = self.load_tasi()
+        if source == "api":
+            tasi = self.fetch_tasi_live()
+        elif source == "supabase":
+            tasi = self.load_from_supabase()
+        elif source == "auto":
+            tasi = self.update_supabase()
+        else:
+            tasi = self.load_tasi()
+
         start = tasi["Date"].min().strftime("%Y-%m-%d")
         end = tasi["Date"].max().strftime("%Y-%m-%d")
 

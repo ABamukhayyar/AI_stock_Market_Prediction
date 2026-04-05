@@ -20,19 +20,66 @@ from prediction.engine import PredictionEngine
 from train_model import FEATURE_COLUMNS, TARGET_COLUMN
 
 
+def _get_live_sentiment() -> dict:
+    """Fetch today's sentiment and store in Supabase."""
+    try:
+        from sentiment.analyzer import SentimentAnalyzer
+        analyzer = SentimentAnalyzer()
+        result = analyzer.analyze_and_store(symbol="TASI")
+        return result
+    except Exception as e:
+        print(f"[WARN] Sentiment analysis failed: {e}")
+        return {"score": 0, "confidence": 0, "sentiment_encoded": 0}
+
+
+def _merge_sentiment_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge sentiment data into prediction DataFrame."""
+    try:
+        from db.supabase_client import get_sentiment
+        sent_df = get_sentiment("TASI")
+        if not sent_df.empty:
+            sent_df = sent_df.rename(columns={
+                "date": "Date",
+                "sentiment_score": "Sentiment_Score",
+                "confidence": "Sentiment_Confidence",
+                "sentiment_encoded": "Sentiment_Encoded",
+            })
+            sent_df = sent_df[["Date", "Sentiment_Score", "Sentiment_Confidence",
+                               "Sentiment_Encoded"]]
+            df = pd.merge(df, sent_df, on="Date", how="left")
+    except Exception as e:
+        print(f"[WARN] Could not load sentiment from Supabase: {e}")
+
+    for col, default in [("Sentiment_Score", 0), ("Sentiment_Confidence", 0),
+                         ("Sentiment_Encoded", 0)]:
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = df[col].ffill().fillna(default)
+    return df
+
+
 def predict_next_day(
     csv_path: str = "TASI_Historical_Data.csv",
     model_path: str = "models/TASI_Model_v3.keras",
     scaler_path: str = "models/TASI_Scaler_v3.pkl",
     lookback: int = 60,
-) -> float:
+    run_sentiment: bool = True,
+) -> tuple[float, str, str]:
     """Predict the next trading day's closing price.
 
-    Returns the predicted price in SAR.
+    Returns (predicted_price, target_date, last_data_date) as SAR price and date strings.
     """
-    # 1. Load data
+    # 1. Load data — fetch latest from API, update Supabase, then use it
     das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all()
+    df = das.load_all(source="auto")
+    last_data_date = df["Date"].max().strftime("%Y-%m-%d")
+
+    # 1b. Fetch live sentiment and merge
+    if run_sentiment:
+        print("[INFO] Running live sentiment analysis...")
+        _get_live_sentiment()
+    df = _merge_sentiment_for_prediction(df)
 
     # 2. Technical indicators
     df = TechnicalAnalysisService.add_all(df)
@@ -89,7 +136,16 @@ def predict_next_day(
     # 10. Convert return to price
     pred_price = last_close * (1 + pred_return)
 
-    return pred_price
+    # 11. Determine target date (next trading day after last data date)
+    # Saudi market trades Sun-Thu, so skip Fri/Sat
+    from datetime import datetime, timedelta
+    last_dt = datetime.strptime(last_data_date, "%Y-%m-%d")
+    next_dt = last_dt + timedelta(days=1)
+    while next_dt.weekday() in (4, 5):  # 4=Friday, 5=Saturday
+        next_dt += timedelta(days=1)
+    target_date = next_dt.strftime("%Y-%m-%d")
+
+    return pred_price, target_date, last_data_date
 
 
 def main():
@@ -101,6 +157,8 @@ def main():
     parser.add_argument("--scaler", default="models/TASI_Scaler_v3.pkl",
                         help="Path to fitted scaler")
     parser.add_argument("--lookback", type=int, default=60)
+    parser.add_argument("--no-sentiment", action="store_true",
+                        help="Skip live sentiment analysis")
     args = parser.parse_args()
 
     # Validate files exist
@@ -110,15 +168,35 @@ def main():
             sys.exit(1)
 
     try:
-        price = predict_next_day(
+        price, target_date, last_data_date = predict_next_day(
             csv_path=args.csv,
             model_path=args.model,
             scaler_path=args.scaler,
             lookback=args.lookback,
+            run_sentiment=not args.no_sentiment,
         )
         print("\n" + "=" * 50)
-        print(f"  Predicted Next-Day TASI Close: {price:,.2f} SAR")
+        print(f"  Based on data up to: {last_data_date}")
+        print(f"  Predicting for:      {target_date}")
+        print(f"  Predicted TASI Close: {price:,.2f} SAR")
         print("=" * 50)
+
+        # Store prediction in Supabase
+        try:
+            from db.supabase_client import insert_prediction
+            insert_prediction(
+                model_id=1,
+                symbol="TASI",
+                target_date=target_date,
+                predicted_close=float(price),
+                used_sentiment=not args.no_sentiment,
+                used_technical=True,
+                input_features=",".join(FEATURE_COLUMNS),
+            )
+            print(f"[INFO] Prediction stored in Supabase for {target_date}")
+        except Exception as e:
+            print(f"[WARN] Could not store prediction in Supabase: {e}")
+
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)

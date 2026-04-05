@@ -81,6 +81,10 @@ class PreprocessingEngine:
     # Stationarity (returns conversion)
     # ------------------------------------------------------------------
 
+    # Columns to convert to returns (percentage change).
+    # Sentiment columns (Sentiment_Score, Sentiment_Confidence, Sentiment_Encoded)
+    # are already stationary and must NOT be converted.
+    # RSI, MACD, Bollinger_Width are also already stationary.
     RETURN_COLUMNS = [
         "Open", "High", "Low", "Close", "Volume",
         "SMA_50", "EMA_20", "ATR",

@@ -4,4 +4,7 @@ __pycache__/
 models/*.keras
 models/*.pkl
 models/*.png
+models/finbert/
+models/opus-mt-ar-en/
 .env
+AI_stock_Market_Prediction/
