@@ -5,8 +5,8 @@ CSC 496 graduation project (King Saud University). AI-assisted decision-making s
 
 **Team:** Abdullah Bamukhayyar + 4 members | **Supervisor:** Dr. Fawaz Alsulaiman
 **GitHub:** https://github.com/ABamukhayyar/AI_stock_Market_Prediction
-**Frontend:** React (handled by another team member) | **Backend:** Python (TensorFlow, yfinance, pandas)
-**Database:** Supabase (hosted PostgreSQL)
+**Frontend:** React 18 (CRA) | **Backend:** Python (TensorFlow, scikit-learn, yfinance, pandas)
+**API:** FastAPI (localhost:8000) | **Database:** Supabase (hosted PostgreSQL)
 
 ---
 
@@ -17,30 +17,50 @@ CSC 496 graduation project (King Saud University). AI-assisted decision-making s
                           │                                            ↓
 [Google News RSS] ──→ [Sentiment Analysis] ──→ [Supabase DB] ← [Feature Store]
                                                      ↓              ↑
-[React Dashboard] ←── [Supabase DB] ←── [Prediction Engine] ───────┘
+[React Frontend] ←── [FastAPI Backend] ←── [Prediction Engine] ────┘
+ (localhost:3000)      (localhost:8000)     (CNN + Linear models)
 ```
 
 ### Project Structure
 ```
-.env                                → Supabase credentials (not in git)
+api/                                → FastAPI backend
+  main.py                           → App setup, CORS, routes
+  routes/stocks.py                  → Stock data endpoints
+  routes/predictions.py             → Prediction + confidence endpoints
+  routes/auth.py                    → Authentication endpoints
+  routes/watchlist.py               → Watchlist endpoints
+frontend/                           → React website
+  src/Pages/                        → Dashboard, StockDetail, AllStocks, etc.
+  src/components/                   → Layout, SearchInput, buttons
+  src/StockData.js                  → API helpers + model colors
+  src/LanguageContext.js             → EN/AR bilingual translations
 data_acquisition/market_data.py     → DataAcquisitionService (CSV, yfinance API, Supabase)
 preprocessing/engine.py             → PreprocessingEngine (denoise, scale, sequence)
 technical_analysis/indicators.py    → TechnicalAnalysisService (RSI, MACD, ATR, etc.)
 prediction/engine.py                → PredictionEngine (CNN-BiLSTM-Attention model)
+prediction/linear/features.py       → Linear model feature engineering (51 features)
+prediction/linear/engine.py         → LinearPredictionEngine (ElasticNetCV)
 sentiment/analyzer.py               → SentimentAnalyzer (news fetch, translate, score)
-db/supabase_client.py               → Supabase client (all DB read/write operations)
-train_model.py                      → ModelTrainer (end-to-end training pipeline)
-predict.py                          → CLI prediction (auto-fetches data + sentiment)
-evaluate.py                         → Backtest + metrics
-models/                             → Saved .keras, .pkl, and cached NLP models
-notebooks/                          → Old Jupyter experiments
-TASI_Historical_Data.csv            → Original CSV (backup; live data from yfinance)
+db/supabase_client.py               → Supabase client (all DB operations + get_or_register_model)
+train_model.py                      → CNN training pipeline
+predict.py                          → CLI prediction (--model-type cnn|linear|all)
+evaluate.py                         → Model evaluation (--model-type cnn|linear|all)
+models/TASI_Model_v3.keras          → Trained CNN model
+models/TASI_Scaler_v3.pkl           → CNN scaler (RobustScaler)
+models/tasi_linear_model.pkl        → Trained Linear model (ElasticNetCV)
+models/tasi_linear_scaler.pkl       → Linear scaler (StandardScaler)
+models/finbert/                     → Cached FinBERT NLP model
+models/opus-mt-ar-en/               → Cached MarianMT translation model
+TASI_Historical_Data.csv            → Original CSV backup
+PRESENTATION_GUIDE.md               → Full demo walkthrough + Q&A
+FRONTEND_ISSUES.md                  → Known frontend issues
 ```
 
 ---
 
-## Current Model: CNN-BiLSTM-Attention (v3)
+## Two AI Models
 
+### Model 1: CNN-BiLSTM-Attention (v3)
 - **Task:** Next-day closing price prediction (regression)
 - **Architecture:** Conv1D → MaxPool → BiLSTM → MultiHeadAttention → BiLSTM → Dense → Linear
 - **Features (19):** OHLCV + 6 technical indicators + 5 macro indicators + 3 sentiment features
@@ -50,11 +70,21 @@ TASI_Historical_Data.csv            → Original CSV (backup; live data from yfi
 - **Loss:** Huber (delta=1.0) | **Optimizer:** Adam (lr=0.001, clipnorm=1.0)
 - **Batch:** 32 | **Epochs:** 100 | **EarlyStopping:** patience=25 | **ReduceLROnPlateau:** patience=8
 - **Split:** 70% train / 15% val / 15% test (chronological)
-- **Target metrics:** MAPE < 10%, R² > 0.5
+- **Accuracy:** MAPE 0.21%, R² 0.9961, Direction Accuracy 82.74%
+
+### Model 2: Linear (ElasticNetCV)
+- **Task:** Next-day return prediction → converted to price
+- **Architecture:** ElasticNetCV (L1+L2 regularized linear regression)
+- **Features (51):** Returns, slopes, MA ratios, volatility, RSI, MACD, Bollinger, volume, regime dummies, calendar, macro returns, interaction terms
+- **Lookback:** 1 day (no sequence)
+- **Scaler:** StandardScaler
+- **Training:** Walk-forward validation, compared ElasticNet/Ridge/BayesianRidge
+- **Accuracy:** MAPE 0.58%, R² 0.9773, Direction Accuracy 54.30%
+- **Extra macro data:** VIX (^VIX) and S&P futures (ES=F) — fetched by `prediction/linear/features.py`
 
 ---
 
-## The 19 Features
+## The 19 CNN Features
 
 | #  | Feature               | Category   | Source           |
 |----|-----------------------|------------|------------------|
@@ -93,14 +123,14 @@ TASI_Historical_Data.csv            → Original CSV (backup; live data from yfi
 - Gold: `GC=F`
 - Dollar Index: `DX-Y.NYB`
 - Interest Rate: `^TNX` (US 10Y Treasury)
-- Merged by date with forward-fill
+- VIX: `^VIX` (Linear model only)
+- S&P Futures: `ES=F` (Linear model only)
 
 ### Sentiment Data
 - **Source:** Google News RSS (8 Arabic + 9 English feeds)
 - **Pipeline:** Fetch articles → filter Saudi-specific → translate Arabic via MarianMT → score with hybrid Arabic lexicon (60%) + FinBERT (40%) for Arabic articles, pure FinBERT for English
 - **Output:** score (-100 to 100), confidence (0-100%), label (Bullish/Neutral/Bearish), encoded (-1/0/1)
 - **Storage:** Supabase `sentiment_analysis` table
-- **NLP Models:** Cached locally in `models/opus-mt-ar-en/` and `models/finbert/`
 
 ---
 
@@ -115,11 +145,77 @@ TASI_Historical_Data.csv            → Original CSV (backup; live data from yfi
 | `technical_indicators` | RSI, MACD, ATR, Bollinger, SMA, EMA          |
 | `sentiment_analysis`   | Daily sentiment scores + article counts       |
 | `company_financials`   | Earnings reports                             |
-| `ai_models`            | Model registry (name, version, type)         |
-| `ai_predictions`       | Predicted prices + metadata                  |
+| `ai_models`            | Model registry (CNN model_id=1, Linear model_id=2) |
+| `ai_predictions`       | Predicted prices + confidence + metadata     |
 | `model_accuracy_log`   | Actual vs predicted accuracy tracking         |
 | `users`                | User accounts                                |
 | `user_watchlists`      | User stock watchlists                        |
+
+---
+
+## FastAPI Endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/health` | Health check |
+| GET | `/api/stocks` | List all stocks with latest predictions |
+| GET | `/api/stocks/{id}` | Stock detail + model_predictions for switcher |
+| GET | `/api/stocks/{id}/history` | OHLCV price history |
+| GET | `/api/stocks/list` | Stock universe for search |
+| GET | `/api/stocks/batch?ids=X,Y` | Batch fetch for watchlist |
+| GET | `/api/predictions` | Recent predictions |
+| GET | `/api/predictions/latest` | One prediction per stock (Dashboard) |
+| GET | `/api/predictions/models` | List AI models |
+| GET | `/api/predictions/accuracy` | Accuracy log |
+| POST | `/api/predictions/run` | Trigger new prediction |
+| POST | `/api/auth/signup` | User registration |
+| POST | `/api/auth/login` | User login |
+| GET | `/api/watchlist/{user_id}` | Get watchlist |
+| POST | `/api/watchlist` | Add to watchlist |
+| DELETE | `/api/watchlist` | Remove from watchlist |
+
+---
+
+## Confidence Score Calculation
+
+Computed from multiple factors (0-100):
+- **Base:** 50 points
+- **Historical accuracy:** +0 to +25 (from model_accuracy_log — lower error = higher boost)
+- **Signal strength:** +0 to +15 (larger predicted moves = more decisive)
+- **Sentiment alignment:** -5 to +10 (news agrees with prediction = boost)
+- **Model type:** +0 to +10 (CNN gets bonus for higher historical accuracy)
+
+Stored in DB as 0.0-1.0 (confidence_score column), displayed as 0-100% on frontend.
+
+---
+
+## How to Run
+
+### Start the System
+```bash
+# Terminal 1 — Backend API
+cd c:\Users\Admin\Desktop\Grap_Project_Insight
+python -m uvicorn api.main:app --port 8000
+
+# Terminal 2 — Frontend
+cd c:\Users\Admin\Desktop\Grap_Project_Insight\frontend
+npm start
+```
+
+### Run Predictions
+```bash
+python predict.py                          # CNN only (default)
+python predict.py --model-type linear      # Linear only
+python predict.py --model-type all         # Both models
+python predict.py --model-type all --no-sentiment  # Skip sentiment
+```
+
+### Evaluate Models
+```bash
+python evaluate.py --model-type cnn        # CNN evaluation
+python evaluate.py --model-type linear     # Linear evaluation
+python evaluate.py --model-type all        # Both + comparison table
+```
 
 ---
 
@@ -138,41 +234,36 @@ TASI_Historical_Data.csv            → Original CSV (backup; live data from yfi
 
 ---
 
-## Prediction Pipeline (what `predict.py` does)
-
-1. Fetches latest TASI data from yfinance API
-2. Updates Supabase `market_data` with new rows
-3. Fetches macroeconomic indicators from yfinance
-4. Runs live sentiment analysis (news fetch + scoring) → stores in Supabase
-5. Computes technical indicators
-6. Preprocesses: denoise → returns → outlier cap → scale
-7. Feeds last 60 days (19 features) into CNN-BiLSTM-Attention model
-8. Outputs predicted next trading day close (SAR)
-9. Stores prediction in Supabase `ai_predictions`
-
-**No manual data download needed.** Just run `python predict.py`.
-
----
-
 ## Dependencies
 ```
+# AI / ML
 tensorflow          # CNN-BiLSTM-Attention model
+scikit-learn        # Linear model (ElasticNetCV) + RobustScaler
 numpy, pandas       # Data manipulation
-scikit-learn        # RobustScaler
+joblib              # Scaler serialization
+
+# Data
 yfinance            # TASI + macro data from API
-matplotlib          # Training plots
 PyWavelets          # Wavelet denoising
 ta                  # Technical indicators
-joblib              # Scaler serialization
-supabase            # Database client
-python-dotenv       # .env loading
-transformers        # FinBERT + MarianMT (sentiment)
+
+# NLP / Sentiment
+transformers        # FinBERT + MarianMT
 torch               # PyTorch backend for transformers
 feedparser          # Google News RSS parsing
 httpx               # HTTP client for RSS feeds
 beautifulsoup4      # HTML cleaning
 lxml                # HTML parser backend
 sentencepiece       # MarianMT tokenizer
+
+# Web / API
+fastapi             # Backend API framework
+uvicorn             # ASGI server
+supabase            # Database client
+python-dotenv       # .env loading
+
+# Visualization
+matplotlib          # Training/evaluation plots
 ```
 
 ---
@@ -181,48 +272,6 @@ sentencepiece       # MarianMT tokenizer
 1. **Phase 1 ✅:** Build CNN-BiLSTM-Attention model for TASI index
 2. **Phase 2 ✅:** Integrate sentiment analysis as additional feature
 3. **Phase 3:** Expand to individual stocks (SABIC, STC, Alrajhi, Almarai)
-4. **Phase 4:** Build FastAPI backend + scheduled prediction cron job
+4. **Phase 4 ✅ (partial):** FastAPI backend built + React frontend integrated
 5. **Phase 5 ✅:** Implement PostgreSQL database (Supabase)
-
----
-
-## Verification Rules
-
-### Before Training
-- [x] Confirm TASI data has Open, High, Low, Close, Volume columns
-- [x] Confirm ATR is calculated using REAL True Range (not Price × 0.02)
-- [x] Confirm scaler is fit ONLY on training data, NOT on test/validation
-- [x] Confirm train/val/test split is chronological (no random shuffling)
-- [x] Confirm wavelet denoising is applied before scaling
-- [x] Confirm no NaN values in feature matrix after preprocessing
-- [x] Print feature matrix shape and verify: (samples, 60, 19)
-- [ ] Print class/target distribution to check for imbalance
-
-### During Training
-- [ ] Monitor val_loss is decreasing (not just train_loss)
-- [ ] Check for overfitting: if train_loss << val_loss, add more regularization
-- [ ] Verify EarlyStopping triggers before max epochs
-- [ ] Log training curves (loss + MAE per epoch) for visual inspection
-
-### After Training — Model Evaluation
-- [ ] Compute ALL metrics on TEST set: RMSE, MAE, MAPE, R²
-- [ ] MAPE should be < 10% (ideally < 5%)
-- [ ] R² should be > 0.5 (ideally > 0.7)
-- [ ] Generate Actual vs Predicted price chart
-- [ ] Check predictions aren't "lagging" (copying yesterday's price)
-- [ ] Verify predictions span a realistic range
-- [ ] Compare with old Golden Model metrics
-
-### Prediction Pipeline Verification
-- [x] `predict.py` runs end-to-end without errors
-- [x] Output is a reasonable price (within ±10% of recent TASI range)
-- [x] Inverse scaling produces actual SAR price
-- [ ] Run prediction 3 times with same input — verify deterministic
-- [ ] Test with deliberately bad input — should fail gracefully
-
-### Before Deployment / Integration
-- [ ] Run full backtest on 2024 data (walk-forward)
-- [ ] Report win rate and average absolute error
-- [x] Save model as `TASI_Model_v3.keras` + `TASI_Scaler_v3.pkl`
-- [x] Register model in `ai_models` Supabase table
-- [ ] Verify model loads correctly in a fresh Python session
+6. **Phase 6 ✅:** Linear model integrated from AI-models branch

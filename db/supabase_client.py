@@ -192,6 +192,28 @@ def register_model(
     return result.data[0]["model_id"]
 
 
+def get_or_register_model(
+    model_name: str,
+    version: str,
+    model_type: str = "CNN-BiLSTM-Attention",
+    prediction_horizon: str = "1d",
+    description: str = "",
+) -> int:
+    """Look up a model by name+version; register it if not found. Returns model_id."""
+    sb = get_client()
+    result = (
+        sb.table("ai_models")
+        .select("model_id")
+        .eq("model_name", model_name)
+        .eq("version", version)
+        .execute()
+    )
+    if result.data:
+        return result.data[0]["model_id"]
+    return register_model(model_name, version, model_type,
+                          prediction_horizon, description)
+
+
 # ======================================================================
 # AI Predictions
 # ======================================================================

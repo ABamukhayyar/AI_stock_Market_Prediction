@@ -1,8 +1,12 @@
 """
 evaluate.py — Comprehensive model evaluation and walk-forward backtesting.
 
+Supports both the CNN-BiLSTM-Attention model and the Linear model.
+
 Usage:
-    python evaluate.py
+    python evaluate.py                              # CNN model (default)
+    python evaluate.py --model-type linear           # Linear model
+    python evaluate.py --model-type all              # Both models
     python evaluate.py --csv TASI_Historical_Data.csv --model models/TASI_Model_v3.keras
 """
 
@@ -49,104 +53,8 @@ def compute_metrics(y_actual: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
-def run_evaluation(
-    csv_path: str = "TASI_Historical_Data.csv",
-    model_path: str = "models/TASI_Model_v3.keras",
-    scaler_path: str = "models/TASI_Scaler_v3.pkl",
-    lookback: int = 60,
-    output_dir: str = "models",
-) -> None:
-    """Full evaluation: test-set metrics + walk-forward backtest."""
-
-    # ---- 1. Load and preprocess data ----
-    print("=" * 60)
-    print("Loading and preprocessing data...")
-    print("=" * 60)
-
-    das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all()
-    df = TechnicalAnalysisService.add_all(df)
-
-    # Match training preprocessing: denoise → returns → outlier cap
-    preproc_prep = PreprocessingEngine(lookback=lookback)
-    denoise_cols = ["Close", "Open", "High", "Low", "Volume",
-                    "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
-    df = preproc_prep.denoise_dataframe(df, denoise_cols)
-
-    # Save original Close before returns conversion
-    df["Close_Orig"] = df["Close"].copy()
-
-    # Convert to returns
-    df = PreprocessingEngine.to_returns(df)
-
-    # Cap outliers on returns
-    numeric_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
-    df = PreprocessingEngine.cap_outliers(df, numeric_cols)
-
-    df.dropna(subset=FEATURE_COLUMNS, inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    # ---- 2. Load model and scaler ----
-    preproc = PreprocessingEngine(lookback=lookback)
-    preproc.load_scaler(scaler_path)
-
-    engine = PredictionEngine(lookback=lookback, n_features=len(FEATURE_COLUMNS))
-    engine.load_model(model_path)
-
-    # ---- 3. Recreate test split (same 70/15/15 as training) ----
-    n = len(df)
-    val_end = int(n * 0.85)
-    test_df = df.iloc[val_end:].copy()
-    test_df.reset_index(drop=True, inplace=True)
-
-    # Original close prices for return→price conversion
-    close_orig = df["Close_Orig"].values
-    test_prev_closes = close_orig[val_end + lookback - 1: -1]
-    test_actual_prices = close_orig[val_end + lookback:]
-
-    print(f"\nTest set: {len(test_df)} trading days")
-    print(f"Period: {test_df['Date'].iloc[0].date()} to {test_df['Date'].iloc[-1].date()}")
-
-    # Scale test data (returns)
-    test_data = test_df[FEATURE_COLUMNS].values.astype(np.float64)
-    test_scaled = preproc.transform(test_data)
-
-    target_idx = FEATURE_COLUMNS.index(TARGET_COLUMN)
-
-    # Create sequences
-    X_test, y_test_scaled = PreprocessingEngine.create_sequences(
-        test_scaled, target_idx, lookback
-    )
-
-    # Predict returns (scaled)
-    y_pred_scaled = engine.predict(X_test)
-
-    # Inverse transform to get actual returns
-    n_feat = len(FEATURE_COLUMNS)
-    dummy_actual = np.zeros((len(y_test_scaled), n_feat))
-    dummy_actual[:, target_idx] = y_test_scaled
-    y_test_returns = preproc.inverse_transform(dummy_actual)[:, target_idx]
-
-    dummy_pred = np.zeros((len(y_pred_scaled), n_feat))
-    dummy_pred[:, target_idx] = y_pred_scaled
-    y_pred_returns = preproc.inverse_transform(dummy_pred)[:, target_idx]
-
-    # Convert returns → prices
-    n_preds = len(y_test_returns)
-    prev_closes = test_prev_closes[:n_preds]
-    actual_prices_ref = test_actual_prices[:n_preds]
-
-    y_actual = prev_closes * (1 + y_test_returns)
-    y_pred = prev_closes * (1 + y_pred_returns)
-
-    test_dates = test_df["Date"].values[lookback:]
-
-    # ---- 4. Compute metrics ----
-    print("\n" + "=" * 60)
-    print("TEST SET METRICS")
-    print("=" * 60)
-
-    metrics = compute_metrics(y_actual, y_pred)
+def _print_metrics(metrics: dict) -> None:
+    """Pretty-print evaluation metrics."""
     print(f"\n{'Metric':<22} {'Value':>12}")
     print("-" * 36)
     print(f"{'MAE':<22} {metrics['MAE']:>12.2f} SAR")
@@ -158,26 +66,184 @@ def run_evaluation(
     target_met = "YES" if metrics["MAPE"] < 10 and metrics["R2"] > 0.5 else "NO"
     print(f"\nTarget (MAPE<10%, R²>0.5): {target_met}")
 
-    # ---- 5. Check for lagging predictions ----
+
+def _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval"):
+    """Generate actual-vs-predicted and error analysis plots."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Actual vs Predicted
+    fig, ax = plt.subplots(figsize=(14, 6))
+    plot_dates = pd.to_datetime(test_dates[: len(y_actual)])
+    ax.plot(plot_dates, y_actual, label="Actual", linewidth=1.5)
+    ax.plot(plot_dates, y_pred, label="Predicted", linewidth=1.5, alpha=0.8)
+    ax.set_title(f"TASI — Actual vs Predicted Closing Price ({prefix})")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price (SAR)")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{prefix}_actual_vs_predicted.png", dpi=150)
+    plt.close()
+    print(f"\n[INFO] Plot saved: {output_dir / f'{prefix}_actual_vs_predicted.png'}")
+
+    # Error distribution
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].hist(errors, bins=40, edgecolor="black", alpha=0.7)
+    axes[0].set_title("Absolute Error Distribution")
+    axes[0].set_xlabel("Error (SAR)")
+    axes[0].set_ylabel("Frequency")
+    axes[0].axvline(errors.mean(), color="red", linestyle="--",
+                    label=f"Mean={errors.mean():.1f}")
+    axes[0].legend()
+
+    axes[1].scatter(y_actual, y_pred, alpha=0.3, s=10)
+    min_val = min(y_actual.min(), y_pred.min())
+    max_val = max(y_actual.max(), y_pred.max())
+    axes[1].plot([min_val, max_val], [min_val, max_val], "r--",
+                 label="Perfect prediction")
+    axes[1].set_title("Actual vs Predicted Scatter")
+    axes[1].set_xlabel("Actual Price (SAR)")
+    axes[1].set_ylabel("Predicted Price (SAR)")
+    axes[1].legend()
+    axes[1].set_aspect("equal")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{prefix}_error_analysis.png", dpi=150)
+    plt.close()
+    print(f"[INFO] Plot saved: {output_dir / f'{prefix}_error_analysis.png'}")
+
+
+# ======================================================================
+# CNN Evaluation
+# ======================================================================
+
+def run_cnn_evaluation(
+    csv_path: str = "TASI_Historical_Data.csv",
+    model_path: str = "models/TASI_Model_v3.keras",
+    scaler_path: str = "models/TASI_Scaler_v3.pkl",
+    lookback: int = 60,
+    output_dir: str = "models",
+) -> dict:
+    """Full evaluation for the CNN-BiLSTM-Attention model."""
+
+    print("=" * 60)
+    print("CNN-BiLSTM-Attention Model Evaluation")
+    print("=" * 60)
+    print("Loading and preprocessing data...")
+
+    das = DataAcquisitionService(csv_path=csv_path)
+    df = das.load_all()
+    df = TechnicalAnalysisService.add_all(df)
+
+    # Merge sentiment data
+    try:
+        from db.supabase_client import get_sentiment
+        sent_df = get_sentiment("TASI")
+        if not sent_df.empty:
+            sent_df = sent_df.rename(columns={
+                "date": "Date",
+                "sentiment_score": "Sentiment_Score",
+                "confidence": "Sentiment_Confidence",
+                "sentiment_encoded": "Sentiment_Encoded",
+            })
+            sent_df = sent_df[["Date", "Sentiment_Score", "Sentiment_Confidence",
+                               "Sentiment_Encoded"]]
+            df = pd.merge(df, sent_df, on="Date", how="left")
+    except Exception as e:
+        print(f"[WARN] Could not load sentiment from Supabase: {e}")
+
+    for col, default in [("Sentiment_Score", 0), ("Sentiment_Confidence", 0),
+                         ("Sentiment_Encoded", 0)]:
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = df[col].ffill().fillna(default)
+
+    # Preprocessing
+    preproc_prep = PreprocessingEngine(lookback=lookback)
+    denoise_cols = ["Close", "Open", "High", "Low", "Volume",
+                    "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
+    df = preproc_prep.denoise_dataframe(df, denoise_cols)
+    df["Close_Orig"] = df["Close"].copy()
+    df = PreprocessingEngine.to_returns(df)
+
+    numeric_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
+    df = PreprocessingEngine.cap_outliers(df, numeric_cols)
+    df.dropna(subset=FEATURE_COLUMNS, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Load model and scaler
+    preproc = PreprocessingEngine(lookback=lookback)
+    preproc.load_scaler(scaler_path)
+
+    engine = PredictionEngine(lookback=lookback, n_features=len(FEATURE_COLUMNS))
+    engine.load_model(model_path)
+
+    # Test split (same 70/15/15)
+    n = len(df)
+    val_end = int(n * 0.85)
+    test_df = df.iloc[val_end:].copy()
+    test_df.reset_index(drop=True, inplace=True)
+
+    close_orig = df["Close_Orig"].values
+    test_prev_closes = close_orig[val_end + lookback - 1: -1]
+
+    print(f"\nTest set: {len(test_df)} trading days")
+    print(f"Period: {test_df['Date'].iloc[0].date()} to {test_df['Date'].iloc[-1].date()}")
+
+    # Scale and predict
+    test_data = test_df[FEATURE_COLUMNS].values.astype(np.float64)
+    test_scaled = preproc.transform(test_data)
+    target_idx = FEATURE_COLUMNS.index(TARGET_COLUMN)
+
+    X_test, y_test_scaled = PreprocessingEngine.create_sequences(
+        test_scaled, target_idx, lookback
+    )
+    y_pred_scaled = engine.predict(X_test)
+
+    # Inverse transform
+    n_feat = len(FEATURE_COLUMNS)
+    dummy_actual = np.zeros((len(y_test_scaled), n_feat))
+    dummy_actual[:, target_idx] = y_test_scaled
+    y_test_returns = preproc.inverse_transform(dummy_actual)[:, target_idx]
+
+    dummy_pred = np.zeros((len(y_pred_scaled), n_feat))
+    dummy_pred[:, target_idx] = y_pred_scaled
+    y_pred_returns = preproc.inverse_transform(dummy_pred)[:, target_idx]
+
+    # Convert returns -> prices
+    n_preds = len(y_test_returns)
+    prev_closes = test_prev_closes[:n_preds]
+
+    y_actual = prev_closes * (1 + y_test_returns)
+    y_pred = prev_closes * (1 + y_pred_returns)
+    test_dates = test_df["Date"].values[lookback:]
+
+    # Metrics
+    print("\n" + "=" * 60)
+    print("TEST SET METRICS (CNN)")
+    print("=" * 60)
+    metrics = compute_metrics(y_actual, y_pred)
+    _print_metrics(metrics)
+
+    # Lag check
     print("\n" + "=" * 60)
     print("LAG CHECK")
     print("=" * 60)
     if len(y_actual) > 2:
-        # A lagging model just copies yesterday's price
-        naive_pred = y_actual[:-1]  # yesterday as prediction for today
+        naive_pred = y_actual[:-1]
         naive_mae = np.mean(np.abs(y_actual[1:] - naive_pred))
-        model_mae = metrics["MAE"]
-        lag_ratio = model_mae / naive_mae if naive_mae > 0 else float("inf")
+        lag_ratio = metrics["MAE"] / naive_mae if naive_mae > 0 else float("inf")
         print(f"Naive (yesterday) MAE: {naive_mae:.2f} SAR")
-        print(f"Model MAE:             {model_mae:.2f} SAR")
+        print(f"Model MAE:             {metrics['MAE']:.2f} SAR")
         print(f"Ratio (model/naive):   {lag_ratio:.3f}")
         if lag_ratio > 0.95:
-            print("[WARN] Model MAE is close to naive baseline — "
-                  "predictions may be lagging (copying yesterday's price).")
+            print("[WARN] Predictions may be lagging (copying yesterday's price).")
         else:
             print("[OK] Model outperforms naive baseline.")
 
-    # ---- 6. Prediction range check ----
+    # Range check
     print("\n" + "=" * 60)
     print("PREDICTION RANGE CHECK")
     print("=" * 60)
@@ -188,67 +254,24 @@ def run_evaluation(
     print(f"Actual std:      {actual_std:.2f}")
     print(f"Predicted std:   {pred_std:.2f}")
     if pred_std < actual_std * 0.3:
-        print("[WARN] Predictions cluster around the mean — model may not be "
-              "capturing price movements.")
+        print("[WARN] Predictions cluster around the mean.")
     else:
         print("[OK] Prediction spread looks reasonable.")
 
-    # ---- 7. Walk-forward backtest on last year of test data ----
+    # Walk-forward backtest
+    errors = np.abs(y_actual - y_pred)
     print("\n" + "=" * 60)
     print("WALK-FORWARD BACKTEST (test period)")
     print("=" * 60)
-
-    errors = np.abs(y_actual - y_pred)
     print(f"Average absolute error: {errors.mean():.2f} SAR")
     print(f"Median absolute error:  {np.median(errors):.2f} SAR")
     print(f"Max absolute error:     {errors.max():.2f} SAR")
     print(f"95th percentile error:  {np.percentile(errors, 95):.2f} SAR")
 
-    # ---- 8. Plots ----
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Plots
+    _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval_cnn")
 
-    # Actual vs Predicted
-    fig, ax = plt.subplots(figsize=(14, 6))
-    plot_dates = pd.to_datetime(test_dates[: len(y_actual)])
-    ax.plot(plot_dates, y_actual, label="Actual", linewidth=1.5)
-    ax.plot(plot_dates, y_pred, label="Predicted", linewidth=1.5, alpha=0.8)
-    ax.set_title("TASI — Actual vs Predicted Closing Price (Test Set)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price (SAR)")
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
-    plt.savefig(output_dir / "eval_actual_vs_predicted.png", dpi=150)
-    plt.close()
-    print(f"\n[INFO] Plot saved: {output_dir / 'eval_actual_vs_predicted.png'}")
-
-    # Error distribution
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    axes[0].hist(errors, bins=40, edgecolor="black", alpha=0.7)
-    axes[0].set_title("Absolute Error Distribution")
-    axes[0].set_xlabel("Error (SAR)")
-    axes[0].set_ylabel("Frequency")
-    axes[0].axvline(errors.mean(), color="red", linestyle="--", label=f"Mean={errors.mean():.1f}")
-    axes[0].legend()
-
-    # Scatter: actual vs predicted
-    axes[1].scatter(y_actual, y_pred, alpha=0.3, s=10)
-    min_val = min(y_actual.min(), y_pred.min())
-    max_val = max(y_actual.max(), y_pred.max())
-    axes[1].plot([min_val, max_val], [min_val, max_val], "r--", label="Perfect prediction")
-    axes[1].set_title("Actual vs Predicted Scatter")
-    axes[1].set_xlabel("Actual Price (SAR)")
-    axes[1].set_ylabel("Predicted Price (SAR)")
-    axes[1].legend()
-    axes[1].set_aspect("equal")
-
-    plt.tight_layout()
-    plt.savefig(output_dir / "eval_error_analysis.png", dpi=150)
-    plt.close()
-    print(f"[INFO] Plot saved: {output_dir / 'eval_error_analysis.png'}")
-
-    # ---- 9. Determinism check ----
+    # Determinism check
     print("\n" + "=" * 60)
     print("DETERMINISM CHECK (3 runs on same input)")
     print("=" * 60)
@@ -260,30 +283,196 @@ def run_evaluation(
         max_diff = max(np.max(np.abs(preds[0] - p)) for p in preds[1:])
         print(f"Max difference between runs: {max_diff:.6f}")
 
-    print("\n[DONE] Evaluation complete.")
+    return metrics
 
+
+# ======================================================================
+# Linear Evaluation
+# ======================================================================
+
+def run_linear_evaluation(
+    csv_path: str = "TASI_Historical_Data.csv",
+    model_path: str = "models/tasi_linear_model.pkl",
+    scaler_path: str = "models/tasi_linear_scaler.pkl",
+    output_dir: str = "models",
+) -> dict:
+    """Full evaluation for the Linear model."""
+    from prediction.linear.engine import LinearPredictionEngine
+    from prediction.linear.features import (
+        FEATURES, build_linear_features, enrich_macro_for_linear,
+    )
+
+    print("=" * 60)
+    print("Linear Model Evaluation")
+    print("=" * 60)
+    print("Loading and preprocessing data...")
+
+    das = DataAcquisitionService(csv_path=csv_path)
+    df = das.load_all()
+
+    # Enrich with VIX + futures
+    df = enrich_macro_for_linear(df)
+
+    # Build features
+    df = build_linear_features(df)
+    df = df.dropna(subset=FEATURES).reset_index(drop=True)
+
+    print(f"\nTotal rows after feature engineering: {len(df)}")
+    print(f"Period: {df['Date'].iloc[0].date()} to {df['Date'].iloc[-1].date()}")
+
+    # Create target: next-day return
+    df["target_return"] = df["Close"].pct_change(1).shift(-1)
+    df = df.dropna(subset=["target_return"]).reset_index(drop=True)
+
+    # Chronological test split (last 15%)
+    n = len(df)
+    test_start = int(n * 0.85)
+    test_df = df.iloc[test_start:].copy().reset_index(drop=True)
+
+    print(f"Test set: {len(test_df)} trading days")
+    print(f"Test period: {test_df['Date'].iloc[0].date()} to "
+          f"{test_df['Date'].iloc[-1].date()}")
+
+    # Load model
+    engine = LinearPredictionEngine()
+    engine.load_model(model_path, scaler_path)
+    print(f"Model type: {engine.model_type}")
+
+    # Predict on each test row
+    X_test = test_df[FEATURES].values
+    closes = test_df["Close"].values
+    actual_returns = test_df["target_return"].values
+
+    # Predict returns
+    X_scaled = engine.scaler.transform(X_test)
+    pred_returns = engine.model.predict(X_scaled)
+
+    # Convert to prices
+    y_actual = closes * (1 + actual_returns)
+    y_pred = closes * (1 + pred_returns)
+    test_dates = test_df["Date"].values
+
+    # Metrics
+    print("\n" + "=" * 60)
+    print("TEST SET METRICS (Linear)")
+    print("=" * 60)
+    metrics = compute_metrics(y_actual, y_pred)
+    _print_metrics(metrics)
+
+    # Direction accuracy on returns directly
+    dir_acc = (np.sign(pred_returns) == np.sign(actual_returns)).mean() * 100
+    print(f"{'Return Dir Accuracy':<22} {dir_acc:>11.2f}%")
+
+    # Lag check
+    print("\n" + "=" * 60)
+    print("LAG CHECK")
+    print("=" * 60)
+    if len(y_actual) > 2:
+        naive_pred = y_actual[:-1]
+        naive_mae = np.mean(np.abs(y_actual[1:] - naive_pred))
+        lag_ratio = metrics["MAE"] / naive_mae if naive_mae > 0 else float("inf")
+        print(f"Naive (yesterday) MAE: {naive_mae:.2f} SAR")
+        print(f"Model MAE:             {metrics['MAE']:.2f} SAR")
+        print(f"Ratio (model/naive):   {lag_ratio:.3f}")
+        if lag_ratio > 0.95:
+            print("[WARN] Predictions may be lagging.")
+        else:
+            print("[OK] Model outperforms naive baseline.")
+
+    # Range check
+    print("\n" + "=" * 60)
+    print("PREDICTION RANGE CHECK")
+    print("=" * 60)
+    print(f"Actual range:    [{y_actual.min():.2f}, {y_actual.max():.2f}]")
+    print(f"Predicted range: [{y_pred.min():.2f}, {y_pred.max():.2f}]")
+    pred_std_val = np.std(y_pred)
+    actual_std_val = np.std(y_actual)
+    print(f"Actual std:      {actual_std_val:.2f}")
+    print(f"Predicted std:   {pred_std_val:.2f}")
+
+    # Walk-forward stats
+    errors = np.abs(y_actual - y_pred)
+    print("\n" + "=" * 60)
+    print("WALK-FORWARD BACKTEST (test period)")
+    print("=" * 60)
+    print(f"Average absolute error: {errors.mean():.2f} SAR")
+    print(f"Median absolute error:  {np.median(errors):.2f} SAR")
+    print(f"Max absolute error:     {errors.max():.2f} SAR")
+    print(f"95th percentile error:  {np.percentile(errors, 95):.2f} SAR")
+
+    # Plots
+    _plot_results(y_actual, y_pred, test_dates, errors, output_dir,
+                  prefix="eval_linear")
+
+    return metrics
+
+
+# ======================================================================
+# Main
+# ======================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate TASI prediction model")
     parser.add_argument("--csv", default="TASI_Historical_Data.csv")
     parser.add_argument("--model", default="models/TASI_Model_v3.keras")
     parser.add_argument("--scaler", default="models/TASI_Scaler_v3.pkl")
+    parser.add_argument("--linear-model", default="models/tasi_linear_model.pkl")
+    parser.add_argument("--linear-scaler", default="models/tasi_linear_scaler.pkl")
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--output-dir", default="models")
+    parser.add_argument("--model-type", choices=["cnn", "linear", "all"],
+                        default="cnn", help="Which model to evaluate (default: cnn)")
     args = parser.parse_args()
 
-    for label, path in [("Model", args.model), ("Scaler", args.scaler)]:
-        if not Path(path).exists():
-            print(f"[ERROR] {label} not found at '{path}'. Run train_model.py first.")
-            sys.exit(1)
+    if args.model_type in ("cnn", "all"):
+        for label, path in [("CNN Model", args.model), ("CNN Scaler", args.scaler)]:
+            if not Path(path).exists():
+                print(f"[ERROR] {label} not found at '{path}'. Run train_model.py first.")
+                sys.exit(1)
 
-    run_evaluation(
-        csv_path=args.csv,
-        model_path=args.model,
-        scaler_path=args.scaler,
-        lookback=args.lookback,
-        output_dir=args.output_dir,
-    )
+    if args.model_type in ("linear", "all"):
+        for label, path in [("Linear Model", args.linear_model),
+                            ("Linear Scaler", args.linear_scaler)]:
+            if not Path(path).exists():
+                print(f"[ERROR] {label} not found at '{path}'.")
+                sys.exit(1)
+
+    all_metrics = {}
+
+    if args.model_type in ("cnn", "all"):
+        cnn_metrics = run_cnn_evaluation(
+            csv_path=args.csv,
+            model_path=args.model,
+            scaler_path=args.scaler,
+            lookback=args.lookback,
+            output_dir=args.output_dir,
+        )
+        all_metrics["CNN"] = cnn_metrics
+
+    if args.model_type in ("linear", "all"):
+        linear_metrics = run_linear_evaluation(
+            csv_path=args.csv,
+            model_path=args.linear_model,
+            scaler_path=args.linear_scaler,
+            output_dir=args.output_dir,
+        )
+        all_metrics["Linear"] = linear_metrics
+
+    # Side-by-side comparison when both models evaluated
+    if len(all_metrics) > 1:
+        print("\n" + "=" * 60)
+        print("MODEL COMPARISON")
+        print("=" * 60)
+        print(f"\n{'Metric':<22} {'CNN':>12} {'Linear':>12}")
+        print("-" * 48)
+        for metric in ["MAE", "RMSE", "MAPE", "R2", "Direction_Accuracy"]:
+            unit = "%" if metric in ("MAPE", "Direction_Accuracy") else " SAR"
+            fmt = ".2f" if metric != "R2" else ".4f"
+            cnn_val = all_metrics["CNN"][metric]
+            lin_val = all_metrics["Linear"][metric]
+            print(f"{metric:<22} {cnn_val:>11{fmt}}{unit} {lin_val:>11{fmt}}{unit}")
+
+    print("\n[DONE] Evaluation complete.")
 
 
 if __name__ == "__main__":
