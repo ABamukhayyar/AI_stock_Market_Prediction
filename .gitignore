@@ -1,10 +1,37 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# Trained model artefacts (regenerable; large)
 models/*.keras
 models/*.pkl
 models/*.png
 models/finbert/
 models/opus-mt-ar-en/
+models/eval_v4/
+models/plots/
+
+# Secrets / credentials
 .env
+
+# IDE / editor
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Frontend build output + deps (regenerable from package.json)
+frontend/node_modules/
+frontend/build/
+frontend/package-lock.json
+
+# Notebook outputs
+notebooks/eda_outputs/
+
+# Mac / Windows clutter
+.DS_Store
+Thumbs.db
+
+# Old / unused project copies
 AI_stock_Market_Prediction/
+.claude/

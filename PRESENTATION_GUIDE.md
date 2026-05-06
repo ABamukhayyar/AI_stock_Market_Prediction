@@ -15,8 +15,9 @@
 6. [Data Pipeline Explained](#6-data-pipeline-explained)
 7. [Confidence Score Explained](#7-confidence-score-explained)
 8. [Technical Details for Q&A](#8-technical-details-for-qa)
-9. [Common Questions & Answers](#9-common-questions--answers)
-10. [Troubleshooting](#10-troubleshooting)
+9. [Honest Metrics, Methodology, and Limitations](#9-honest-metrics-methodology-and-limitations)
+10. [Common Questions & Answers](#10-common-questions--answers)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -601,25 +602,30 @@ Computed using the `ta` library (not manual calculations):
 
 ## 7. Confidence Score Explained
 
-**Simple explanation:** The confidence score answers "how sure is the AI about this prediction?" It's not just a random number — it's computed from three real factors: how accurate the model was on past predictions, how strong the predicted move is, and whether the news sentiment agrees with the prediction direction. Higher confidence = the model has good reasons to trust its own output.
+**This is a heuristic Signal Score, not a calibrated probability.** A 75% on the ring does **not** mean "75% chance the prediction is correct." It is a 0–100 score blending three pieces of evidence: how accurate *this exact (symbol, model)* has been on its own past predictions, how decisive the current predicted move is, and whether today's news sentiment agrees with the direction.
 
-The confidence score (0-100%) is computed from multiple factors:
+The formula lives in `_compute_confidence()` in [predict.py](predict.py).
 
-| Factor | Points | Logic |
-|--------|--------|-------|
-| **Base** | 50 | Starting point |
-| **Historical accuracy** | 0-25 | Low average error from past predictions = high boost |
-| **Signal strength** | 0-15 | Larger predicted moves = more decisive signal |
-| **Sentiment alignment** | -5 to +10 | If sentiment agrees with prediction direction = boost; contradicts = penalty |
-| **Model type** | 0-10 | CNN gets a bonus because it's historically more accurate |
+| Component | Points | How it's computed |
+|---|---|---|
+| **Base** | 50 | Neutral starting point — confidence has to be *earned* with evidence |
+| **Per-(symbol, model) historical accuracy** | 0 to +30 | Average `error_percentage` from `model_accuracy_log` filtered to **only this model's past predictions**. <0.5% → +30, <1% → +20, <2% → +10, <5% → +5, otherwise 0. **A brand-new model with no validated predictions yet contributes 0** — the system refuses to claim confidence it has not earned. |
+| **Signal strength** | 0 to +15 | \|predicted change %\| > 2% → +15, > 1% → +10, > 0.3% → +5 |
+| **Sentiment alignment** | −5 to +10 | Only counted when sentiment confidence > 50%. Sentiment direction agrees with prediction → +10; contradicts → −5 |
 
-**Color coding on the ring:**
-- 90%+ = Dark green (very high confidence)
-- 80-89% = Green (high confidence)
-- 70-79% = Orange (moderate confidence)
-- Below 70% = Red (low confidence)
+Final score = clamp(sum, 0, 100).
 
-The system also automatically checks past predictions against actual market data and logs accuracy in the `model_accuracy_log` table. This feedback loop improves confidence calibration over time.
+**What is NOT in the formula** (and why):
+- **No model-type preference** (e.g., "+10 if CNN"). A previous version of the formula gave CNN an unconditional bonus, but that's a *preference* not *evidence* — the per-model accuracy lookup already rewards whichever model is performing better on this exact stock.
+- **No global error average across all models.** The accuracy lookup is filtered to `ai_predictions.model_id == this_prediction.model_id`, so SABIC's CNN does not inherit confidence from TASI's Linear or vice versa.
+
+**Colour coding on the ring** (frontend):
+- 90%+ = dark green (very high confidence)
+- 80–89% = green (high confidence)
+- 70–79% = orange (moderate confidence)
+- Below 70% = red (low confidence)
+
+**Migration note for the demo:** the per-stock CNN/Linear models that were trained in the multi-stock integration step have **no validated predictions yet** in `model_accuracy_log` (their target dates haven't passed), so their confidence will sit at base+signal+sentiment only — typically 50–65%. As `_check_past_predictions_accuracy()` populates the log over the coming days, those numbers will start to move based on *each model's own track record*. This is the correct, honest behaviour, and worth mentioning if a reviewer asks why the new stocks show lower confidence than TASI initially.
 
 ---
 
@@ -698,19 +704,91 @@ Grap_Project_Insight/
 
 ---
 
-## 9. Common Questions & Answers
+## 9. Honest Metrics, Methodology, and Limitations
+
+This section is the part to memorise for defense. The headline number for the
+CNN — "R² = 0.9963 on TASI" — is **technically true but misleading on its own**
+because it's computed on price levels, where `prev_close` autocorrelation
+dominates. The honest reading puts that number alongside the right comparisons.
+
+### 9.1 Honest TASI metrics (CNN v4, the corrected pipeline)
+
+Test period: 2023-08-27 → 2026-03-26 (646 trading days)
+
+| Metric | Model (v4) | Naive 'predict yesterday' | Reading |
+|---|---|---|---|
+| **Price space** | | | |
+| MAE  | 21.72 SAR | 68.70 SAR | Model is 3.2× better than naive in price MAE |
+| MAPE | 0.19% | — | Below the 0.5–2% range typical for daily-index LSTM/CNN papers |
+| R² (price) | 0.9963 | 0.9762 | Model adds ~2 pp on top of naive — **most of the 0.99 is just price autocorrelation** |
+| **Return space (the honest one)** | | | |
+| R² (returns) | 0.4934 | 0.4717 | Genuine signal: model adds ~2 pp of explained variance over naive |
+| Direction acc (returns) | 83.28% | — | On wavelet-smoothed returns; raw-return direction would be lower |
+
+**v3 → v4 (after the leakage fix):** MAE dropped 24.64 → 21.72 SAR, R²(returns)
+rose 0.4603 → 0.4934, model/naive MAE ratio improved 0.359 → 0.316. The
+leakage fix did not sacrifice performance — it made the model strictly better.
+
+### 9.2 Methodology you can defend
+
+The training pipeline was rewritten in this iteration to remove two classic
+time-series-leakage patterns identified during the audit:
+
+1. **Wavelet denoising is now per-slice.** The `pywt.wavedec` basis is global,
+   so denoising the full series before splitting smooths past samples using
+   future information. Fix: `prepare_data()` splits first, then denoises
+   train, val, and test independently.
+2. **IQR outlier bounds are now train-only.** `fit_outlier_bounds(train)` →
+   `apply_outlier_bounds(slice)` — test outliers can no longer pull the
+   clipping bounds toward themselves.
+3. **RobustScaler is fit on the train slice only** (this was already correct).
+4. **Reproducibility:** `set_seed(42)` is called at the top of `train_model.py`,
+   `predict.py`, and `evaluate.py`. It seeds Python `random`, NumPy,
+   TensorFlow, and `PYTHONHASHSEED`, plus enables TF op-determinism.
+   Running training twice produces identical test metrics.
+5. **Honest evaluation:** `evaluate.py` now reports two metric tables —
+   price-space (the marketing R²) **and** return-space (the honest R²) — and
+   prints the naive lag-1 baseline (both MAE and R²) alongside both.
+
+### 9.3 Limitations (own them in the writeup)
+
+| # | Limitation | Why it matters |
+|---|---|---|
+| L1 | **Macro-feature timing**: TASI closes ~13:00 GMT, US markets close ~21:00 GMT. We merge by date, so day-`t` US close is technically after TASI's close. Predictions are generated *after the US close, before the TASI open the next day* — under that operating assumption the alignment is correct. | Acknowledge explicitly in the methodology section to pre-empt the question. |
+| L2 | **Sentiment date-stamping** is approximate (last 3 days of articles assigned to "today"). Fine for live prediction, approximate for historical backtest. | Flag as "future work: per-day timestamped sentiment". |
+| L3 | **TASI sentiment used as a market-wide proxy** for the 5 individual stocks. Works well for ARAMCO/SABIC (high TASI correlation, ~0.6) and is weakest for SECO (~0.4). | Document as a deliberate v1 scope choice. |
+| L4 | **Direction-on-returns metric** (83.28%) is computed on *denoised* returns. Wavelet smoothing inflates this vs raw-return direction accuracy. | Compute raw-return direction in the appendix as a cross-check. |
+| L5 | **No ARIMA/GARCH baseline** — only naive lag-1. A formal time-series benchmark would strengthen the comparison. | Listed as "future work". |
+| L6 | **Linear model on individual stocks underperforms naive** in return space (RAJHI R²(returns) = −3.05). Linear regression isn't well-suited to per-stock daily returns; the CNN is the workhorse for individual stocks. | Surface honestly — explains why the dashboard prioritises CNN per stock. |
+| L7 | **ARAMCO has only ~6 years of data** (IPO Dec 2019). Lower statistical power than the other 4 stocks. | State explicitly when discussing per-stock results. |
+
+### 9.4 Comparison with prior work
+
+| Reference | MAPE on daily indices | Direction acc (returns) | Notes |
+|---|---|---|---|
+| Random-walk theory | n/a | ~50% | Daily returns are nearly unpredictable |
+| Published equity-return literature | 0.5–2% | 50–60% | R²(returns) usually 0.01–0.05; >0.20 is a leakage red flag |
+| **Insight CNN v4 on TASI** | **0.19%** | **83.28% (denoised)** | R²(returns) = 0.49 is high; partly inflated by denoising |
+
+Many published "LSTM beats stocks" papers have been criticised for the exact
+wavelet-leakage pattern we identified and fixed. Owning that we caught it is
+a stronger position than pretending the inflated number was real.
+
+---
+
+## 10. Common Questions & Answers
 
 **Q: Why not just use a simple moving average?**
-> Our CNN model with 0.21% MAPE significantly outperforms naive baselines. The model/naive MAE ratio is 0.623, meaning our model is 37% better than just using yesterday's price.
+> The CNN beats the naive "predict yesterday's price" baseline by a wide margin on price MAE — model MAE is 21.7 SAR vs naive 68.7 SAR (a ratio of 0.32, i.e., the model's price error is ~32% of the naive's). On the harder return-space R², the CNN reaches 0.49 while naive returns R² is 0.47, so it adds ~2 percentage points of genuine predictive signal beyond price autocorrelation. See Section 11 for the honest metric breakdown.
 
-**Q: How do you prevent overfitting?**
-> Multiple mechanisms: Dropout (0.4), L2 regularization, EarlyStopping (patience 25), ReduceLROnPlateau, chronological data split (no future data leakage), and RobustScaler fitted only on training data.
+**Q: How do you prevent overfitting *and* data leakage?**
+> Five layers: (1) **Per-slice wavelet denoising** — denoising is applied to train, val, and test slices independently, so future samples never smooth past samples. (2) **IQR outlier clipping bounds fit on the train slice only** and reused on val/test. (3) **RobustScaler also fit on train only.** (4) **Chronological 70/15/15 split** — no random shuffle. (5) **Dropout 0.4 + L2 + EarlyStopping(25) + ReduceLROnPlateau**. Plus a **fixed seed (42)** for full reproducibility — running the trainer twice gives identical test metrics.
 
 **Q: Why two models instead of one?**
-> Different approaches provide complementary insights. CNN captures complex non-linear patterns; Linear provides interpretability. If both agree on direction, confidence is higher. This is called model ensembling in practice.
+> Different approaches give complementary signals. CNN captures non-linear sequence patterns; Linear (ElasticNetCV) is fully interpretable per-feature. When both agree on direction, the dashboard's confidence boosts. The two also act as a sanity check on each other.
 
-**Q: Why TASI index and not individual stocks?**
-> We started with TASI as proof of concept (Phase 1). Individual stocks are Phase 3 — the architecture supports it (the `stocks` table and API endpoints are ready), but each stock needs its own training data and model tuning.
+**Q: TASI plus individual stocks?**
+> The system now covers six symbols: **TASI** (the index), **ARAMCO**, **RAJHI**, **SABIC**, **STC**, **SECO** (the five sector-leading Tadawul stocks). Each has its own per-stock CNN and Linear model trained from its own OHLCV history; sentiment is reused from the TASI-wide score as a v1 proxy. Run `python predict.py --symbol SABIC` to predict any of them.
 
 **Q: How does sentiment analysis work?**
 > We scrape 17 Google News RSS feeds daily (8 Arabic, 9 English). Arabic articles are translated to English using the MarianMT neural translation model. All articles are scored using FinBERT — a BERT model fine-tuned on financial text. The sentiment score ranges from -100 (very bearish) to +100 (very bullish).
@@ -729,7 +807,7 @@ Grap_Project_Insight/
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### "Website shows empty/loading"
 - Make sure both terminals are running (API + Frontend)
