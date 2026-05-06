@@ -24,7 +24,7 @@ No existing files were modified. Pure addition.
 
 - ~1,490 rows per stock (6 years x ~250 trading days)
 - ~7,463 rows total written to `market_data`
-- Date range: 2020-05-06 to 2026-05-06
+- Date range: 16 years
 - Zero NaN values across all 5 stocks
 
 ## Note on Aramco history
