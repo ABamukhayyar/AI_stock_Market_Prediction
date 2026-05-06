@@ -20,7 +20,7 @@ STOCKS = {
     "5110.SR": "SECO",
 }
 
-PERIOD = "6y"
+PERIOD = "16y"
 
 
 def fetch_one(ticker: str) -> pd.DataFrame:
