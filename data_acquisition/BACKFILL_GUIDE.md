@@ -27,6 +27,13 @@ No existing files were modified. Pure addition.
 - Date range: 16 years
 - Zero NaN values across all 5 stocks
 
+- SymbolRows  Estimated history
+- ARAMCO1,    598~6.4 years (IPO Dec 2019 → today, as expected)
+- RAJHI3,     964~15.8 years (back to ~2010)
+- SABIC3,     935~15.7 years (back to ~2010)
+- STC3,       929~15.7 years (back to ~2010)
+- SECO3,      927~15.7 years (back to ~2010)
+
 ## Note on Aramco history
 
 Saudi Aramco IPO'd on December 11, 2019, so its full history begins there.
