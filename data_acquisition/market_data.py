@@ -22,8 +22,18 @@ class DataAcquisitionService:
         "Interest_Rate": "^TNX",
     }
 
-    def __init__(self, csv_path: str = "TASI_Historical_Data.csv"):
+    def __init__(
+        self,
+        csv_path: str = "TASI_Historical_Data.csv",
+        symbol: str = "TASI",
+        ticker: str = "^TASI.SR",
+    ):
+        # Symbol = the Supabase `stocks.symbol` key (e.g. "TASI", "SABIC").
+        # Ticker = the yfinance ticker (e.g. "^TASI.SR", "2010.SR").
+        # Defaults preserve TASI behaviour for legacy callers.
         self.csv_path = Path(csv_path)
+        self.symbol = symbol
+        self.ticker = ticker
 
     # ------------------------------------------------------------------
     # TASI CSV loading
@@ -153,17 +163,19 @@ class DataAcquisitionService:
     # Live TASI data from yfinance
     # ------------------------------------------------------------------
 
-    TASI_TICKER = "^TASI.SR"
+    TASI_TICKER = "^TASI.SR"  # legacy class attribute — instances now use self.ticker
 
     def fetch_tasi_live(self, start: str = "2008-10-01") -> pd.DataFrame:
-        """Fetch TASI OHLCV data directly from yfinance (no CSV needed).
+        """Fetch live OHLCV data directly from yfinance for self.ticker.
 
-        Returns DataFrame with columns: Date, Open, High, Low, Close, Volume
+        Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
+        Uses auto_adjust=True to make returns continuous across split events
+        (the EDA found phantom +300% spikes in raw RAJHI/STC data otherwise).
         """
-        print(f"[INFO] Fetching TASI data from yfinance ({self.TASI_TICKER})...")
-        data = yf.download(self.TASI_TICKER, start=start, progress=False)
+        print(f"[INFO] Fetching {self.symbol} data from yfinance ({self.ticker})...")
+        data = yf.download(self.ticker, start=start, progress=False, auto_adjust=True)
         if data.empty:
-            raise RuntimeError("Could not fetch TASI data from yfinance")
+            raise RuntimeError(f"Could not fetch {self.symbol} data from yfinance")
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
@@ -183,13 +195,14 @@ class DataAcquisitionService:
     # Supabase data loading
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def load_from_supabase() -> pd.DataFrame:
-        """Load TASI OHLCV data from Supabase market_data table."""
+    def load_from_supabase(self) -> pd.DataFrame:
+        """Load OHLCV data from Supabase market_data for self.symbol."""
         from db.supabase_client import get_market_data
-        df = get_market_data("TASI")
+        df = get_market_data(self.symbol)
         if df.empty:
-            raise RuntimeError("No TASI data in Supabase market_data table")
+            raise RuntimeError(
+                f"No data in Supabase market_data table for symbol '{self.symbol}'"
+            )
         df = df.rename(columns={
             "date": "Date", "open": "Open", "high": "High",
             "low": "Low", "close": "Close", "volume": "Volume",
@@ -197,30 +210,30 @@ class DataAcquisitionService:
         df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df.sort_values("Date", inplace=True)
         df.reset_index(drop=True, inplace=True)
-        print(f"[INFO] Loaded {len(df)} trading days from Supabase "
+        print(f"[INFO] Loaded {len(df)} trading days from Supabase for {self.symbol} "
               f"({df['Date'].min().date()} to {df['Date'].max().date()})")
         return df
 
     def update_supabase(self) -> pd.DataFrame:
-        """Fetch latest TASI data from yfinance and upsert into Supabase.
+        """Fetch latest yfinance data for self.ticker and upsert into Supabase.
 
         Returns the full up-to-date DataFrame.
         """
         from db.supabase_client import get_market_data, upsert_market_data
 
-        # Check what's already in Supabase
-        existing = get_market_data("TASI")
+        existing = get_market_data(self.symbol)
         if not existing.empty:
             last_date = existing["date"].max().strftime("%Y-%m-%d")
-            print(f"[INFO] Supabase has data up to {last_date}")
-            # Fetch only new data (from last date onward to catch updates)
-            new_data = yf.download(self.TASI_TICKER, start=last_date, progress=False)
+            print(f"[INFO] Supabase has {self.symbol} data up to {last_date}")
+            new_data = yf.download(self.ticker, start=last_date, progress=False,
+                                    auto_adjust=True)
         else:
-            print("[INFO] Supabase is empty — fetching full TASI history")
-            new_data = yf.download(self.TASI_TICKER, start="2008-10-01", progress=False)
+            print(f"[INFO] Supabase has no {self.symbol} data — full history fetch")
+            new_data = yf.download(self.ticker, start="2008-10-01", progress=False,
+                                    auto_adjust=True)
 
         if new_data.empty:
-            print("[INFO] No new TASI data from yfinance")
+            print(f"[INFO] No new {self.symbol} data from yfinance")
         else:
             if isinstance(new_data.columns, pd.MultiIndex):
                 new_data.columns = new_data.columns.get_level_values(0)
@@ -228,10 +241,10 @@ class DataAcquisitionService:
             new_df.index.name = "Date"
             new_df.reset_index(inplace=True)
             new_df["Date"] = pd.to_datetime(new_df["Date"])
-            count = upsert_market_data(new_df, symbol="TASI")
-            print(f"[INFO] Upserted {count} rows into Supabase market_data")
+            count = upsert_market_data(new_df, symbol=self.symbol)
+            print(f"[INFO] Upserted {count} rows into Supabase market_data "
+                  f"for {self.symbol}")
 
-        # Return the full dataset from Supabase
         return self.load_from_supabase()
 
     # ------------------------------------------------------------------

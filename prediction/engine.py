@@ -101,7 +101,7 @@ class PredictionEngine:
 
     def get_callbacks(
         self,
-        model_path: str = "models/TASI_Model_v3.keras",
+        model_path: str = "models/TASI_Model_v4.keras",
         patience_es: int = 25,
         patience_lr: int = 8,
     ) -> list:
@@ -136,7 +136,7 @@ class PredictionEngine:
         y_val: np.ndarray,
         epochs: int = 100,
         batch_size: int = 32,
-        model_path: str = "models/TASI_Model_v3.keras",
+        model_path: str = "models/TASI_Model_v4.keras",
     ) -> keras.callbacks.History:
         """Train the model with EarlyStopping and LR reduction."""
         if self.model is None:
@@ -169,14 +169,14 @@ class PredictionEngine:
     # Save / Load
     # ------------------------------------------------------------------
 
-    def save_model(self, path: str = "models/TASI_Model_v3.keras") -> None:
+    def save_model(self, path: str = "models/TASI_Model_v4.keras") -> None:
         if self.model is None:
             raise RuntimeError("No model to save.")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.model.save(path)
         print(f"[INFO] Model saved to {path}")
 
-    def load_model(self, path: str = "models/TASI_Model_v3.keras") -> None:
+    def load_model(self, path: str = "models/TASI_Model_v4.keras") -> None:
         self.model = keras.models.load_model(path)
         print(f"[INFO] Model loaded from {path}")
         self.model.summary()

@@ -7,7 +7,7 @@ Usage:
     python predict.py                              # CNN model (default)
     python predict.py --model-type linear           # Linear model
     python predict.py --model-type all              # Both models
-    python predict.py --csv TASI_Historical_Data.csv --model models/TASI_Model_v3.keras
+    python predict.py --symbol SABIC --model-type all       # any registered stock
 """
 
 import argparse
@@ -15,10 +15,15 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Seed everything before TF / NumPy ops happen anywhere downstream.
+from utils.seed import set_seed
+set_seed(42)
+
 import numpy as np
 import pandas as pd
 
 from data_acquisition.market_data import DataAcquisitionService
+from data_acquisition.registry import get_stock_info
 from technical_analysis.indicators import TechnicalAnalysisService
 from preprocessing.engine import PreprocessingEngine
 from prediction.engine import PredictionEngine
@@ -26,7 +31,11 @@ from train_model import FEATURE_COLUMNS, TARGET_COLUMN
 
 
 def _get_live_sentiment() -> dict:
-    """Fetch today's sentiment and store in Supabase."""
+    """Fetch today's TASI-wide sentiment and store in Supabase under "TASI".
+
+    Per project decision, individual stocks reuse TASI sentiment as a market-wide
+    proxy in v1 — so we always score and store under "TASI".
+    """
     try:
         from sentiment.analyzer import SentimentAnalyzer
         analyzer = SentimentAnalyzer()
@@ -145,16 +154,23 @@ def _get_target_date(last_data_date: str) -> str:
 # ======================================================================
 
 def predict_cnn(
-    csv_path: str = "TASI_Historical_Data.csv",
-    model_path: str = "models/TASI_Model_v3.keras",
-    scaler_path: str = "models/TASI_Scaler_v3.pkl",
+    symbol: str = "TASI",
+    csv_path: str | None = None,
+    model_path: str | None = None,
+    scaler_path: str | None = None,
     lookback: int = 60,
     run_sentiment: bool = True,
 ) -> dict:
-    """Predict next-day close using the CNN-BiLSTM-Attention model."""
-    # 1. Load data
-    das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all(source="auto")
+    """Predict next-day close for `symbol` using the CNN-BiLSTM-Attention model."""
+    info = get_stock_info(symbol)
+    csv_path = csv_path or info.get("csv_path", "TASI_Historical_Data.csv")
+    model_path = model_path or info["cnn_model_path"]
+    scaler_path = scaler_path or info["cnn_scaler_path"]
+
+    # 1. Load data — TASI from yfinance/CSV+macro, others from Supabase+macro
+    das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
+                                  ticker=info["yfinance_ticker"])
+    df = das.load_all(source="auto" if symbol == "TASI" else "supabase")
     last_data_date = df["Date"].max().strftime("%Y-%m-%d")
 
     # 1b. Fetch live sentiment and merge
@@ -168,24 +184,34 @@ def predict_cnn(
     # 2. Technical indicators
     df = TechnicalAnalysisService.add_all(df)
 
-    # 2b. Store technical indicators in Supabase
+    # 2b. Store technical indicators in Supabase under this stock's symbol.
     try:
         from db.supabase_client import upsert_technical_indicators
-        upsert_technical_indicators(df.tail(5), symbol="TASI")
+        upsert_technical_indicators(df.tail(5), symbol=symbol)
     except Exception as e:
         print(f"[WARN] Could not store technical indicators: {e}")
 
-    # 3. Preprocessing: denoise -> returns -> outlier cap
-    preproc_prep = PreprocessingEngine(lookback=lookback)
+    # 3. Preprocessing: load trained scaler+bounds, then denoise → returns → cap → scale
+    # At inference we have all past data; denoising the full series is safe (no future
+    # leakage). IQR bounds come from the train-only fit saved alongside the scaler;
+    # if loading a legacy scaler with no bounds, fall back to fit-and-apply on the
+    # current series (same behaviour as the pre-fix predict.py).
+    preproc = PreprocessingEngine(lookback=lookback)
+    preproc.load_scaler(scaler_path)
+
     denoise_cols = ["Close", "Open", "High", "Low", "Volume",
                     "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
-    df = preproc_prep.denoise_dataframe(df, denoise_cols)
+    df = preproc.denoise_dataframe(df, denoise_cols)
 
     last_close = df["Close"].iloc[-1]
     df = PreprocessingEngine.to_returns(df)
 
     numeric_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
-    df = PreprocessingEngine.cap_outliers(df, numeric_cols)
+    if preproc._outlier_bounds:
+        df = preproc.apply_outlier_bounds(df, numeric_cols)
+    else:
+        # Legacy scaler file with no saved bounds — replicate old behaviour.
+        df = PreprocessingEngine.cap_outliers(df, numeric_cols)
 
     df.dropna(subset=FEATURE_COLUMNS, inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -195,10 +221,6 @@ def predict_cnn(
             f"Not enough data after preprocessing. Need at least {lookback} rows, "
             f"got {len(df)}."
         )
-
-    # 6. Load scaler and scale
-    preproc = PreprocessingEngine(lookback=lookback)
-    preproc.load_scaler(scaler_path)
 
     recent = df[FEATURE_COLUMNS].iloc[-lookback:].values.astype(np.float64)
     recent_scaled = preproc.transform(recent)
@@ -227,6 +249,7 @@ def predict_cnn(
     target_date = _get_target_date(last_data_date)
 
     return {
+        "symbol": symbol,
         "model_price": model_price,
         "final_price": final_price,
         "vs": last_close,
@@ -234,7 +257,7 @@ def predict_cnn(
         "sentiment": sentiment,
         "target_date": target_date,
         "last_data_date": last_data_date,
-        "model_name": "TASI_CNN_v3",
+        "model_name": info["model_label_cnn"],
         "model_label": "CNN-BiLSTM-Attention",
     }
 
@@ -244,20 +267,27 @@ def predict_cnn(
 # ======================================================================
 
 def predict_linear(
-    csv_path: str = "TASI_Historical_Data.csv",
-    model_path: str = "models/tasi_linear_model.pkl",
-    scaler_path: str = "models/tasi_linear_scaler.pkl",
+    symbol: str = "TASI",
+    csv_path: str | None = None,
+    model_path: str | None = None,
+    scaler_path: str | None = None,
     run_sentiment: bool = True,
 ) -> dict:
-    """Predict next-day close using the Linear model."""
+    """Predict next-day close for `symbol` using the Linear model."""
     from prediction.linear.engine import LinearPredictionEngine
     from prediction.linear.features import (
         FEATURES, build_linear_features, enrich_macro_for_linear,
     )
 
-    # 1. Load data via our existing pipeline
-    das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all(source="auto")
+    info = get_stock_info(symbol)
+    csv_path = csv_path or info.get("csv_path", "TASI_Historical_Data.csv")
+    model_path = model_path or info["linear_model_path"]
+    scaler_path = scaler_path or info["linear_scaler_path"]
+
+    # 1. Load data via the existing pipeline (source depends on symbol)
+    das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
+                                  ticker=info["yfinance_ticker"])
+    df = das.load_all(source="auto" if symbol == "TASI" else "supabase")
     last_data_date = df["Date"].max().strftime("%Y-%m-%d")
 
     # 1b. Sentiment (for post-prediction adjustment, not a model feature)
@@ -305,6 +335,7 @@ def predict_linear(
     target_date = _get_target_date(last_data_date)
 
     return {
+        "symbol": symbol,
         "model_price": model_price,
         "final_price": final_price,
         "vs": last_close,
@@ -313,7 +344,7 @@ def predict_linear(
         "sentiment": sentiment,
         "target_date": target_date,
         "last_data_date": last_data_date,
-        "model_name": "TASI_Linear_v1",
+        "model_name": info["model_label_linear"],
         "model_label": f"Linear ({result['model_type']})",
         "signal_strength": result.get("confidence", "N/A"),
         "ci_low": result.get("ci_low"),
@@ -351,17 +382,38 @@ def _print_result(result: dict, no_sentiment: bool = False) -> None:
     print(f"  Final Prediction:    {result['final_price']:,.2f} SAR")
 
 
-def _compute_confidence(result: dict) -> float:
-    """Compute a confidence score (0-100) for a prediction.
+def _compute_confidence(result: dict, model_id: int | None = None) -> float:
+    """0-100 'Signal Score' for the dashboard's AI Confidence ring.
 
-    Based on signal strength, sentiment alignment, and model type.
+    HEURISTIC, not a calibrated probability. Components:
+      - Base 50 (neutral — confidence has to be earned with evidence)
+      - Per-(symbol, model_id) historical accuracy: avg error_percentage across
+        this exact model's past validated predictions in `model_accuracy_log`.
+        Lower past error -> higher contribution. New models with no validated
+        predictions yet contribute zero — the system refuses to claim
+        confidence it has not earned.
+      - Signal strength: how decisive is the predicted move (|change %|).
+      - Sentiment alignment: does today's news agree with the prediction
+        direction? Only counted when the sentiment analysis itself is confident.
+
+    Explicitly NOT in the formula:
+      - Any model-type preference (CNN vs Linear). Preferences are not evidence;
+        the per-model accuracy lookup speaks for itself.
+
+    Parameters
+    ----------
+    result    : dict from predict_cnn / predict_linear
+    model_id  : the ai_models.model_id this prediction was registered under.
+                When provided, the historical-accuracy lookup is filtered to
+                this exact (model, symbol) pair via ai_predictions.model_id.
+                When None (or no validated rows exist yet), the historical
+                contribution is 0.
     """
-    score = 50.0  # base
+    score = 50.0  # neutral base
 
-    # Signal strength: bigger predicted move = more decisive
-    model_price = result.get("model_price", 0)
-    final_price = result.get("final_price", model_price)
-    last_close = result.get("vs", model_price)
+    # ---- Signal strength: bigger predicted move = more decisive ----
+    model_price = result.get("model_price", 0) or 0
+    last_close = result.get("vs", model_price) or model_price
     if last_close and last_close > 0:
         change_pct = abs((model_price - last_close) / last_close * 100)
         if change_pct > 2:
@@ -371,66 +423,76 @@ def _compute_confidence(result: dict) -> float:
         elif change_pct > 0.3:
             score += 5
 
-    # Sentiment alignment
-    sent = result.get("sentiment", {})
-    sent_score = sent.get("score", 0)
-    sent_conf = sent.get("confidence", 0)
+    # ---- Sentiment alignment ----
+    sent = result.get("sentiment", {}) or {}
+    sent_score = sent.get("score", 0) or 0
+    sent_conf = sent.get("confidence", 0) or 0
     if sent_conf > 50:
         pred_up = model_price > last_close if last_close else True
         sent_up = sent_score > 0
-        if pred_up == sent_up:
-            score += 10
-        else:
-            score -= 5
+        score += 10 if pred_up == sent_up else -5
 
-    # Model type bonus: CNN is more accurate historically
-    if "CNN" in result.get("model_name", ""):
-        score += 10
-
-    # Check historical accuracy
-    try:
-        from db.supabase_client import get_client
-        sb = get_client()
-        logs = sb.table("model_accuracy_log").select("error_percentage").execute()
-        if logs.data:
-            avg_error = sum(l["error_percentage"] for l in logs.data) / len(logs.data)
-            if avg_error < 2:
-                score += 15
-            elif avg_error < 5:
-                score += 8
-    except Exception:
-        pass
+    # ---- Per-(symbol, model_id) historical accuracy ----
+    # Filter model_accuracy_log to rows whose prediction_id was created by
+    # THIS specific model_id. Empty history -> 0 contribution (no claim).
+    if model_id is not None:
+        try:
+            from db.supabase_client import get_client
+            sb = get_client()
+            preds = (sb.table("ai_predictions")
+                       .select("prediction_id")
+                       .eq("model_id", model_id)
+                       .execute())
+            pred_ids = [p["prediction_id"] for p in (preds.data or [])]
+            if pred_ids:
+                logs = (sb.table("model_accuracy_log")
+                          .select("error_percentage")
+                          .in_("prediction_id", pred_ids)
+                          .execute())
+                rows = logs.data or []
+                if rows:
+                    avg_error = sum(r["error_percentage"] for r in rows) / len(rows)
+                    if avg_error < 0.5:
+                        score += 30
+                    elif avg_error < 1:
+                        score += 20
+                    elif avg_error < 2:
+                        score += 10
+                    elif avg_error < 5:
+                        score += 5
+        except Exception:
+            pass  # DB unreachable or row missing -> historical contribution stays 0
 
     return max(0, min(100, round(score)))
 
 
 def _store_prediction(result: dict, no_sentiment: bool = False) -> None:
-    """Store prediction in Supabase with correct model_id."""
+    """Store prediction in Supabase with correct model_id and stock symbol."""
     try:
         from db.supabase_client import get_or_register_model, insert_prediction
 
-        # Determine model registration details
+        symbol = result["symbol"]
         model_name = result["model_name"]
         if "CNN" in model_name:
             model_id = get_or_register_model(
-                model_name="TASI_CNN_BiLSTM_Attention", version="v3",
+                model_name=model_name, version="v4" if symbol == "TASI" else "v1",
                 model_type="CNN-BiLSTM-Attention",
-                description="CNN-BiLSTM-Attention with 19 features, 60-day lookback.",
+                description=f"{symbol} CNN-BiLSTM-Attention, 19 features, 60-day lookback.",
             )
             input_features = ",".join(FEATURE_COLUMNS)
         else:
             from prediction.linear.features import FEATURES as LINEAR_FEATURES
             model_id = get_or_register_model(
-                model_name=model_name, version="1.0",
+                model_name=model_name, version="v1",
                 model_type=result.get("model_label", "Linear"),
-                description="Linear model with 48 features. Walk-forward validated.",
+                description=f"{symbol} linear model with 48 features.",
             )
             input_features = ",".join(LINEAR_FEATURES)
 
-        confidence = _compute_confidence(result)
+        confidence = _compute_confidence(result, model_id=model_id)
         insert_prediction(
             model_id=model_id,
-            symbol="TASI",
+            symbol=symbol,
             target_date=result["target_date"],
             predicted_close=float(result["final_price"]),
             confidence_score=round(confidence / 100.0, 4),
@@ -438,8 +500,8 @@ def _store_prediction(result: dict, no_sentiment: bool = False) -> None:
             used_technical=True,
             input_features=input_features,
         )
-        print(f"[INFO] Prediction stored in Supabase for {result['target_date']} "
-              f"(model_id={model_id})")
+        print(f"[INFO] Prediction stored in Supabase for {symbol} "
+              f"target={result['target_date']} (model_id={model_id})")
     except Exception as e:
         print(f"[WARN] Could not store prediction in Supabase: {e}")
 
@@ -449,17 +511,14 @@ def _store_prediction(result: dict, no_sentiment: bool = False) -> None:
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict next-day TASI closing price")
-    parser.add_argument("--csv", default="TASI_Historical_Data.csv",
-                        help="Path to TASI_Historical_Data.csv")
-    parser.add_argument("--model", default="models/TASI_Model_v3.keras",
-                        help="Path to trained CNN model")
-    parser.add_argument("--scaler", default="models/TASI_Scaler_v3.pkl",
-                        help="Path to fitted CNN scaler")
-    parser.add_argument("--linear-model", default="models/tasi_linear_model.pkl",
-                        help="Path to trained linear model")
-    parser.add_argument("--linear-scaler", default="models/tasi_linear_scaler.pkl",
-                        help="Path to fitted linear scaler")
+    parser = argparse.ArgumentParser(description="Predict next-day closing price")
+    parser.add_argument("--symbol", default="TASI",
+                        help="Stock symbol (TASI/ARAMCO/RAJHI/SABIC/STC/SECO).")
+    parser.add_argument("--csv", default=None, help="Override CSV path (TASI only).")
+    parser.add_argument("--model", default=None, help="Override CNN model path.")
+    parser.add_argument("--scaler", default=None, help="Override CNN scaler path.")
+    parser.add_argument("--linear-model", default=None, help="Override linear model path.")
+    parser.add_argument("--linear-scaler", default=None, help="Override linear scaler path.")
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--no-sentiment", action="store_true",
                         help="Skip live sentiment analysis")
@@ -467,20 +526,27 @@ def main():
                         default="cnn", help="Which model to use (default: cnn)")
     args = parser.parse_args()
 
-    # Validate files exist based on model type
+    # Resolve per-symbol paths so we can validate file existence cleanly.
+    info = get_stock_info(args.symbol)
+    cnn_model = args.model or info["cnn_model_path"]
+    cnn_scaler = args.scaler or info["cnn_scaler_path"]
+    linear_model = args.linear_model or info["linear_model_path"]
+    linear_scaler = args.linear_scaler or info["linear_scaler_path"]
+
     if args.model_type in ("cnn", "all"):
-        for label, path in [("CNN Model", args.model), ("CNN Scaler", args.scaler)]:
+        for label, path in [("CNN Model", cnn_model), ("CNN Scaler", cnn_scaler)]:
             if not Path(path).exists():
-                print(f"[ERROR] {label} not found at '{path}'. Run train_model.py first.")
+                print(f"[ERROR] {label} not found at '{path}'. "
+                      f"Run train_model.py --symbol {args.symbol} first.")
                 sys.exit(1)
     if args.model_type in ("linear", "all"):
-        for label, path in [("Linear Model", args.linear_model),
-                            ("Linear Scaler", args.linear_scaler)]:
+        for label, path in [("Linear Model", linear_model),
+                            ("Linear Scaler", linear_scaler)]:
             if not Path(path).exists():
-                print(f"[ERROR] {label} not found at '{path}'.")
+                print(f"[ERROR] {label} not found at '{path}'. "
+                      f"Run train_linear.py --symbol {args.symbol} first.")
                 sys.exit(1)
 
-    # Check accuracy of past predictions
     print("[INFO] Checking past prediction accuracy...")
     _check_past_predictions_accuracy()
 
@@ -488,22 +554,24 @@ def main():
         results = []
 
         if args.model_type in ("cnn", "all"):
-            print("\n[INFO] Running CNN-BiLSTM-Attention prediction...")
+            print(f"\n[INFO] Running CNN prediction for {args.symbol}...")
             cnn_result = predict_cnn(
+                symbol=args.symbol,
                 csv_path=args.csv,
-                model_path=args.model,
-                scaler_path=args.scaler,
+                model_path=cnn_model,
+                scaler_path=cnn_scaler,
                 lookback=args.lookback,
                 run_sentiment=not args.no_sentiment,
             )
             results.append(cnn_result)
 
         if args.model_type in ("linear", "all"):
-            print("\n[INFO] Running Linear model prediction...")
+            print(f"\n[INFO] Running Linear prediction for {args.symbol}...")
             linear_result = predict_linear(
+                symbol=args.symbol,
                 csv_path=args.csv,
-                model_path=args.linear_model,
-                scaler_path=args.linear_scaler,
+                model_path=linear_model,
+                scaler_path=linear_scaler,
                 run_sentiment=not args.no_sentiment,
             )
             results.append(linear_result)

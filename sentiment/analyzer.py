@@ -3,8 +3,8 @@ SentimentAnalyzer — fetches TASI-related news from Google News RSS,
 translates Arabic headlines, and scores sentiment using a hybrid
 Arabic financial lexicon + FinBERT approach.
 
-Extracted from TASI_Sentiment.ipynb and adapted for local use.
-Models are cached in models/ directory on first run.
+Productionised from an early notebook prototype.
+NLP models are cached in models/ directory on first run.
 """
 
 import os

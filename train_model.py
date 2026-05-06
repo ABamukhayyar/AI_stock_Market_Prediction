@@ -2,16 +2,25 @@
 ModelTrainer — orchestrates the full training pipeline:
     1. Load TASI + macro data
     2. Compute technical indicators
-    3. Wavelet denoise + outlier capping
-    4. Drop NaN rows (from indicator warm-up)
-    5. Chronological split → scale (train only) → create sequences
-    6. Build & train CNN-BiLSTM-Attention model
-    7. Save model + scaler
-    8. Plot training curves
+    3. Save raw Close as Close_Orig + drop indicator warm-up NaN
+    4. Chronological split → per-slice denoise + returns + IQR (train-fit) + scale
+       → create sequences
+    5. Build & train CNN-BiLSTM-Attention model
+    6. Save model + scaler bundle (scaler + outlier bounds)
+    7. Plot training curves
+
+Leakage fix vs. the previous version: wavelet denoising and IQR outlier
+capping are now applied PER SLICE inside prepare_data() and the IQR bounds
+are fit on the TRAIN slice only, so test/val data never informs train-side
+preprocessing parameters.
 """
 
 import argparse
 from pathlib import Path
+
+# Seed everything before TF / NumPy ops happen anywhere downstream.
+from utils.seed import set_seed
+set_seed(42)
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend
@@ -20,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from data_acquisition.market_data import DataAcquisitionService
+from data_acquisition.registry import get_stock_info
 from technical_analysis.indicators import TechnicalAnalysisService
 from preprocessing.engine import PreprocessingEngine
 from prediction.engine import PredictionEngine
@@ -43,23 +53,32 @@ class ModelTrainer:
 
     def __init__(
         self,
-        csv_path: str = "TASI_Historical_Data.csv",
-        model_path: str = "models/TASI_Model_v3.keras",
-        scaler_path: str = "models/TASI_Scaler_v3.pkl",
+        symbol: str = "TASI",
+        csv_path: str | None = None,
+        model_path: str | None = None,
+        scaler_path: str | None = None,
         lookback: int = 60,
         epochs: int = 100,
         batch_size: int = 32,
     ):
-        self.csv_path = csv_path
-        self.model_path = model_path
-        self.scaler_path = scaler_path
+        info = get_stock_info(symbol)
+        self.symbol = symbol
+        self.ticker = info["yfinance_ticker"]
+        # Allow CLI overrides; otherwise pull from registry. CSV is TASI-only.
+        self.csv_path = csv_path or info.get("csv_path", "")
+        self.model_path = model_path or info["cnn_model_path"]
+        self.scaler_path = scaler_path or info["cnn_scaler_path"]
         self.lookback = lookback
         self.epochs = epochs
         self.batch_size = batch_size
 
     @staticmethod
     def _merge_sentiment(df: pd.DataFrame) -> pd.DataFrame:
-        """Merge sentiment data from Supabase into the main DataFrame."""
+        """Merge TASI-wide sentiment as a proxy for every symbol.
+
+        Sentiment is fetched as `get_sentiment("TASI")` even when training a
+        per-stock model, per the v1 scope decision (documented in the writeup).
+        """
         try:
             from db.supabase_client import get_sentiment
             sent_df = get_sentiment("TASI")
@@ -92,10 +111,17 @@ class ModelTrainer:
     def run(self) -> None:
         # ---- 1. Data acquisition ----
         print("=" * 60)
-        print("STEP 1: Loading TASI data + macroeconomic indicators")
+        print(f"STEP 1: Loading {self.symbol} data + macroeconomic indicators")
         print("=" * 60)
-        das = DataAcquisitionService(csv_path=self.csv_path)
-        df = das.load_all()
+        das = DataAcquisitionService(
+            csv_path=self.csv_path or "TASI_Historical_Data.csv",
+            symbol=self.symbol,
+            ticker=self.ticker,
+        )
+        # TASI has the CSV backup; everything else trains from Supabase market_data
+        # (populated by backfill_stocks.py).
+        source = "csv" if self.symbol == "TASI" else "supabase"
+        df = das.load_all(source=source)
 
         # ---- 1b. Merge sentiment data ----
         print("\n" + "=" * 60)
@@ -109,6 +135,15 @@ class ModelTrainer:
         print("=" * 60)
         df = TechnicalAnalysisService.add_all(df)
 
+        # Store technical indicators in Supabase under this stock's symbol.
+        try:
+            from db.supabase_client import upsert_technical_indicators
+            count = upsert_technical_indicators(df, symbol=self.symbol)
+            print(f"[INFO] Stored {count} rows of technical indicators in Supabase "
+                  f"for {self.symbol}")
+        except Exception as e:
+            print(f"[WARN] Could not store technical indicators in Supabase: {e}")
+
         # Verify ATR is real (not Price * 0.02)
         sample_atr = df["ATR"].dropna().iloc[-1]
         sample_close = df["Close"].dropna().iloc[-1]
@@ -117,54 +152,31 @@ class ModelTrainer:
             print("[WARN] ATR looks suspiciously close to 2% of price. "
                   "Double-check the ATR calculation!")
 
-        # ---- 3. Wavelet denoising ----
+        # ---- 3. Save raw Close + drop indicator warm-up NaN ----
+        # Close_Orig must be carried through prepare_data so we can convert
+        # predicted returns back into prices for the eval block.
+        df["Close_Orig"] = df["Close"].copy()
+        before = len(df)
+        df.dropna(subset=FEATURE_COLUMNS, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        print(f"[INFO] Dropped {before - len(df)} indicator-warmup NaN rows. "
+              f"Remaining: {len(df)}")
+
+        # ---- 4. Prepare data — per-slice denoise + returns + train-fit IQR + scale ----
         print("\n" + "=" * 60)
-        print("STEP 3: Wavelet denoising + outlier capping")
+        print("STEP 4: Per-slice denoise/returns + train-fit IQR + scale + sequence")
         print("=" * 60)
         preproc = PreprocessingEngine(lookback=self.lookback)
 
         denoise_cols = ["Close", "Open", "High", "Low", "Volume",
                         "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
-        df = preproc.denoise_dataframe(df, denoise_cols)
-
-        # ---- 3b. Convert non-stationary features to returns ----
-        # Saves original Close for converting predictions back to price.
-        # Returns are stationary so the scaler generalises across time periods.
-        df["Close_Orig"] = df["Close"].copy()
-        print("[INFO] Converting non-stationary features to returns...")
-        df = PreprocessingEngine.to_returns(df)
-
-        # Cap outliers on returns (not on raw price levels)
-        numeric_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
-        df = preproc.cap_outliers(df, numeric_cols)
-
-        # ---- 4. Drop NaN rows (from indicator warm-up + pct_change) ----
-        before = len(df)
-        df.dropna(subset=FEATURE_COLUMNS, inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        print(f"[INFO] Dropped {before - len(df)} rows with NaN "
-              f"(indicator warm-up + returns). Remaining: {len(df)}")
-
-        # Verify no NaNs
-        nan_counts = df[FEATURE_COLUMNS].isna().sum()
-        if nan_counts.sum() > 0:
-            print(f"[ERROR] NaN values remaining:\n{nan_counts[nan_counts > 0]}")
-            raise ValueError("Feature matrix contains NaN values after cleanup.")
-
-        # ---- 5. Prepare data (split, scale, sequence) ----
-        print("\n" + "=" * 60)
-        print("STEP 4: Chronological split, scaling (train only), sequencing")
-        print("=" * 60)
-
-        # Save original Close prices for return→price conversion
-        close_orig = df["Close_Orig"].values
-        n_rows = len(df)
-        val_end_idx = int(n_rows * 0.85)
 
         result = preproc.prepare_data(
             df,
             feature_columns=FEATURE_COLUMNS,
             target_column=TARGET_COLUMN,
+            denoise_cols=denoise_cols,
+            return_cols=PreprocessingEngine.RETURN_COLUMNS,
         )
 
         X_train = result["X_train"]
@@ -217,14 +229,10 @@ class ModelTrainer:
         dummy_pred[:, target_idx] = y_pred_scaled
         y_pred_returns = preproc.inverse_transform(dummy_pred)[:, target_idx]
 
-        # Convert returns → actual prices
-        test_prev_closes = close_orig[val_end_idx + self.lookback - 1: -1]
-        test_actual_prices = close_orig[val_end_idx + self.lookback:]
-
-        # Trim to match prediction length
+        # Convert returns → actual prices using prev-closes returned from prepare_data
+        test_prev_closes = result["test_prev_closes"]
         n_preds = len(y_test_returns)
         test_prev_closes = test_prev_closes[:n_preds]
-        test_actual_prices = test_actual_prices[:n_preds]
 
         y_test_actual = test_prev_closes * (1 + y_test_returns)
         y_pred_actual = test_prev_closes * (1 + y_pred_returns)
@@ -304,19 +312,22 @@ class ModelTrainer:
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train TASI CNN-BiLSTM-Attention model")
-    parser.add_argument("--csv", default="TASI_Historical_Data.csv",
-                        help="Path to TASI_Historical_Data.csv")
-    parser.add_argument("--model", default="models/TASI_Model_v3.keras",
-                        help="Path to save trained model")
-    parser.add_argument("--scaler", default="models/TASI_Scaler_v3.pkl",
-                        help="Path to save fitted scaler")
+    parser = argparse.ArgumentParser(description="Train CNN-BiLSTM-Attention model")
+    parser.add_argument("--symbol", default="TASI",
+                        help="Stock symbol (TASI/ARAMCO/RAJHI/SABIC/STC/SECO).")
+    parser.add_argument("--csv", default=None,
+                        help="Path to CSV (TASI only). Other symbols read from Supabase.")
+    parser.add_argument("--model", default=None,
+                        help="Override model save path (otherwise from registry).")
+    parser.add_argument("--scaler", default=None,
+                        help="Override scaler save path (otherwise from registry).")
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
     trainer = ModelTrainer(
+        symbol=args.symbol,
         csv_path=args.csv,
         model_path=args.model,
         scaler_path=args.scaler,

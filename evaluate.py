@@ -7,12 +7,16 @@ Usage:
     python evaluate.py                              # CNN model (default)
     python evaluate.py --model-type linear           # Linear model
     python evaluate.py --model-type all              # Both models
-    python evaluate.py --csv TASI_Historical_Data.csv --model models/TASI_Model_v3.keras
+    python evaluate.py --symbol SABIC --model-type all      # any registered stock
 """
 
 import argparse
 import sys
 from pathlib import Path
+
+# Seed before any TF / NumPy ops happen downstream.
+from utils.seed import set_seed
+set_seed(42)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from data_acquisition.market_data import DataAcquisitionService
+from data_acquisition.registry import get_stock_info
 from technical_analysis.indicators import TechnicalAnalysisService
 from preprocessing.engine import PreprocessingEngine
 from prediction.engine import PredictionEngine
@@ -28,7 +33,13 @@ from train_model import FEATURE_COLUMNS, TARGET_COLUMN
 
 
 def compute_metrics(y_actual: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Compute regression metrics."""
+    """Compute regression metrics on price-level data.
+
+    NOTE: when y_actual and y_pred are reconstructed prices (prev_close × (1+r)),
+    the R² is dominated by `prev_close` variance and is not a measure of
+    predictive signal. Always read this *alongside* compute_metrics_returns()
+    and naive_baseline().
+    """
     mae = np.mean(np.abs(y_actual - y_pred))
     rmse = np.sqrt(np.mean((y_actual - y_pred) ** 2))
     mape = np.mean(np.abs((y_actual - y_pred) / y_actual)) * 100
@@ -36,7 +47,10 @@ def compute_metrics(y_actual: np.ndarray, y_pred: np.ndarray) -> dict:
     ss_tot = np.sum((y_actual - np.mean(y_actual)) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
 
-    # Direction accuracy: did we predict the correct direction of change?
+    # Direction-on-prices: does the predicted *price level* go up/down across
+    # consecutive days the same way as the actual? Kept for backwards-compat;
+    # for the *return-target* models, prefer the direction-on-returns metric
+    # computed in run_cnn_evaluation / run_linear_evaluation.
     if len(y_actual) > 1:
         actual_dir = np.diff(y_actual) > 0
         pred_dir = np.diff(y_pred) > 0
@@ -51,6 +65,46 @@ def compute_metrics(y_actual: np.ndarray, y_pred: np.ndarray) -> dict:
         "R2": r2,
         "Direction_Accuracy": direction_acc,
     }
+
+
+def compute_metrics_returns(actual_returns: np.ndarray,
+                             pred_returns: np.ndarray) -> dict:
+    """The honest return-space metrics.
+
+    Returns are stationary, so R² here actually measures predictive signal
+    rather than reflecting price-level autocorrelation. Direction accuracy
+    is computed as sign-agreement on returns, which is the meaningful
+    "did we call tomorrow's up/down right?" metric.
+    """
+    mae = np.mean(np.abs(actual_returns - pred_returns))
+    rmse = np.sqrt(np.mean((actual_returns - pred_returns) ** 2))
+    ss_res = np.sum((actual_returns - pred_returns) ** 2)
+    ss_tot = np.sum((actual_returns - np.mean(actual_returns)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
+    direction_acc = float(np.mean(np.sign(actual_returns) == np.sign(pred_returns))) * 100
+    return {
+        "MAE_returns": mae,
+        "RMSE_returns": rmse,
+        "R2_returns": r2,
+        "Direction_Accuracy_returns": direction_acc,
+    }
+
+
+def naive_baseline(y_actual: np.ndarray) -> dict:
+    """Naive 'predict tomorrow = today' baseline metrics over the same series.
+
+    Use this to put any 'impressive' R² in context. If the model R² is not
+    materially above this, the model is essentially copying yesterday's price.
+    """
+    if len(y_actual) < 2:
+        return {"naive_MAE": 0.0, "naive_R2": 0.0}
+    naive_pred = y_actual[:-1]
+    target = y_actual[1:]
+    mae = float(np.mean(np.abs(target - naive_pred)))
+    ss_res = float(np.sum((target - naive_pred) ** 2))
+    ss_tot = float(np.sum((target - np.mean(target)) ** 2))
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
+    return {"naive_MAE": mae, "naive_R2": r2}
 
 
 def _print_metrics(metrics: dict) -> None:
@@ -119,21 +173,27 @@ def _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval
 # ======================================================================
 
 def run_cnn_evaluation(
-    csv_path: str = "TASI_Historical_Data.csv",
-    model_path: str = "models/TASI_Model_v3.keras",
-    scaler_path: str = "models/TASI_Scaler_v3.pkl",
+    symbol: str = "TASI",
+    csv_path: str | None = None,
+    model_path: str | None = None,
+    scaler_path: str | None = None,
     lookback: int = 60,
     output_dir: str = "models",
 ) -> dict:
     """Full evaluation for the CNN-BiLSTM-Attention model."""
+    info = get_stock_info(symbol)
+    csv_path = csv_path or info.get("csv_path", "TASI_Historical_Data.csv")
+    model_path = model_path or info["cnn_model_path"]
+    scaler_path = scaler_path or info["cnn_scaler_path"]
 
     print("=" * 60)
-    print("CNN-BiLSTM-Attention Model Evaluation")
+    print(f"CNN-BiLSTM-Attention Model Evaluation — {symbol}")
     print("=" * 60)
     print("Loading and preprocessing data...")
 
-    das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all()
+    das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
+                                  ticker=info["yfinance_ticker"])
+    df = das.load_all(source="csv" if symbol == "TASI" else "supabase")
     df = TechnicalAnalysisService.add_all(df)
 
     # Merge sentiment data
@@ -160,49 +220,50 @@ def run_cnn_evaluation(
         else:
             df[col] = df[col].ffill().fillna(default)
 
-    # Preprocessing
-    preproc_prep = PreprocessingEngine(lookback=lookback)
-    denoise_cols = ["Close", "Open", "High", "Low", "Volume",
-                    "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
-    df = preproc_prep.denoise_dataframe(df, denoise_cols)
+    # Preprocessing — match the new training pipeline exactly:
+    # save Close_Orig, drop indicator-warmup NaN, then per-slice (denoise →
+    # to_returns → drop pct-change NaN) on the test slice using the saved
+    # IQR bounds + scaler from training.
     df["Close_Orig"] = df["Close"].copy()
-    df = PreprocessingEngine.to_returns(df)
-
-    numeric_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
-    df = PreprocessingEngine.cap_outliers(df, numeric_cols)
     df.dropna(subset=FEATURE_COLUMNS, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Load model and scaler
     preproc = PreprocessingEngine(lookback=lookback)
-    preproc.load_scaler(scaler_path)
+    preproc.load_scaler(scaler_path)  # bundle: scaler + outlier_bounds
 
     engine = PredictionEngine(lookback=lookback, n_features=len(FEATURE_COLUMNS))
     engine.load_model(model_path)
 
-    # Test split (same 70/15/15)
+    # Chronological 70/15/15 — same boundaries as training.
     n = len(df)
     val_end = int(n * 0.85)
-    test_df = df.iloc[val_end:].copy()
-    test_df.reset_index(drop=True, inplace=True)
+    test_slice = df.iloc[val_end:].copy().reset_index(drop=True)
 
-    close_orig = df["Close_Orig"].values
-    test_prev_closes = close_orig[val_end + lookback - 1: -1]
+    # Per-slice denoise → returns → drop pct_change NaN → apply saved IQR bounds.
+    denoise_cols = ["Close", "Open", "High", "Low", "Volume",
+                    "Oil", "SP500", "Gold", "DXY", "Interest_Rate"]
+    test_slice = preproc.denoise_dataframe(test_slice, denoise_cols)
+    test_slice = PreprocessingEngine.to_returns(test_slice)
+    test_slice = test_slice.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
+    if preproc._outlier_bounds:
+        test_slice = preproc.apply_outlier_bounds(test_slice, FEATURE_COLUMNS)
+    else:
+        test_slice = PreprocessingEngine.cap_outliers(test_slice, FEATURE_COLUMNS)
 
-    print(f"\nTest set: {len(test_df)} trading days")
-    print(f"Period: {test_df['Date'].iloc[0].date()} to {test_df['Date'].iloc[-1].date()}")
+    print(f"\nTest set: {len(test_slice)} trading days")
+    print(f"Period: {test_slice['Date'].iloc[0].date()} to "
+          f"{test_slice['Date'].iloc[-1].date()}")
 
-    # Scale and predict
-    test_data = test_df[FEATURE_COLUMNS].values.astype(np.float64)
+    # Scale + sequences
+    test_data = test_slice[FEATURE_COLUMNS].values.astype(np.float64)
     test_scaled = preproc.transform(test_data)
     target_idx = FEATURE_COLUMNS.index(TARGET_COLUMN)
-
     X_test, y_test_scaled = PreprocessingEngine.create_sequences(
         test_scaled, target_idx, lookback
     )
     y_pred_scaled = engine.predict(X_test)
 
-    # Inverse transform
+    # Inverse transform → returns space
     n_feat = len(FEATURE_COLUMNS)
     dummy_actual = np.zeros((len(y_test_scaled), n_feat))
     dummy_actual[:, target_idx] = y_test_scaled
@@ -212,36 +273,58 @@ def run_cnn_evaluation(
     dummy_pred[:, target_idx] = y_pred_scaled
     y_pred_returns = preproc.inverse_transform(dummy_pred)[:, target_idx]
 
-    # Convert returns -> prices
+    # Convert to prices using prev-close from the test slice's Close_Orig
+    test_prev_closes = test_slice["Close_Orig"].values[lookback - 1: -1]
     n_preds = len(y_test_returns)
     prev_closes = test_prev_closes[:n_preds]
 
     y_actual = prev_closes * (1 + y_test_returns)
     y_pred = prev_closes * (1 + y_pred_returns)
-    test_dates = test_df["Date"].values[lookback:]
+    test_dates = test_slice["Date"].values[lookback:][:n_preds]
 
-    # Metrics
+    # ---- Honest metrics: report price-space + return-space + naive baseline ----
     print("\n" + "=" * 60)
-    print("TEST SET METRICS (CNN)")
+    print("TEST SET METRICS (CNN) — PRICE SPACE")
     print("=" * 60)
     metrics = compute_metrics(y_actual, y_pred)
     _print_metrics(metrics)
 
-    # Lag check
     print("\n" + "=" * 60)
-    print("LAG CHECK")
+    print("TEST SET METRICS (CNN) — RETURN SPACE  [the honest one]")
     print("=" * 60)
-    if len(y_actual) > 2:
-        naive_pred = y_actual[:-1]
-        naive_mae = np.mean(np.abs(y_actual[1:] - naive_pred))
-        lag_ratio = metrics["MAE"] / naive_mae if naive_mae > 0 else float("inf")
-        print(f"Naive (yesterday) MAE: {naive_mae:.2f} SAR")
-        print(f"Model MAE:             {metrics['MAE']:.2f} SAR")
-        print(f"Ratio (model/naive):   {lag_ratio:.3f}")
+    metrics_returns = compute_metrics_returns(y_test_returns, y_pred_returns)
+    print(f"{'MAE (returns)':<28} {metrics_returns['MAE_returns']:>12.6f}")
+    print(f"{'RMSE (returns)':<28} {metrics_returns['RMSE_returns']:>12.6f}")
+    print(f"{'R² (returns)':<28} {metrics_returns['R2_returns']:>12.4f}")
+    print(f"{'Direction acc (returns)':<28} "
+          f"{metrics_returns['Direction_Accuracy_returns']:>11.2f}%")
+
+    # Combine for the side-by-side comparison block at the end of main().
+    metrics.update(metrics_returns)
+
+    # Naive baseline — both MAE and R² in price space (the inflated R² needs
+    # this baseline next to it for honest reading).
+    print("\n" + "=" * 60)
+    print("LAG CHECK (naive 'predict tomorrow = today')")
+    print("=" * 60)
+    naive_price = naive_baseline(y_actual)
+    naive_ret = naive_baseline(y_test_returns)
+    print(f"Naive MAE (price):     {naive_price['naive_MAE']:.2f} SAR")
+    print(f"Model MAE (price):     {metrics['MAE']:.2f} SAR")
+    print(f"Naive R²  (price):     {naive_price['naive_R2']:.4f}")
+    print(f"Model R²  (price):     {metrics['R2']:.4f}")
+    print(f"Naive R²  (returns):   {naive_ret['naive_R2']:+.4f}")
+    print(f"Model R²  (returns):   {metrics['R2_returns']:+.4f}")
+    if naive_price['naive_MAE'] > 0:
+        lag_ratio = metrics['MAE'] / naive_price['naive_MAE']
+        print(f"Ratio (model/naive MAE): {lag_ratio:.3f}")
         if lag_ratio > 0.95:
             print("[WARN] Predictions may be lagging (copying yesterday's price).")
         else:
-            print("[OK] Model outperforms naive baseline.")
+            print("[OK] Model outperforms naive baseline on price MAE.")
+    metrics["naive_MAE_price"] = naive_price["naive_MAE"]
+    metrics["naive_R2_price"] = naive_price["naive_R2"]
+    metrics["naive_R2_returns"] = naive_ret["naive_R2"]
 
     # Range check
     print("\n" + "=" * 60)
@@ -291,9 +374,10 @@ def run_cnn_evaluation(
 # ======================================================================
 
 def run_linear_evaluation(
-    csv_path: str = "TASI_Historical_Data.csv",
-    model_path: str = "models/tasi_linear_model.pkl",
-    scaler_path: str = "models/tasi_linear_scaler.pkl",
+    symbol: str = "TASI",
+    csv_path: str | None = None,
+    model_path: str | None = None,
+    scaler_path: str | None = None,
     output_dir: str = "models",
 ) -> dict:
     """Full evaluation for the Linear model."""
@@ -302,13 +386,19 @@ def run_linear_evaluation(
         FEATURES, build_linear_features, enrich_macro_for_linear,
     )
 
+    info = get_stock_info(symbol)
+    csv_path = csv_path or info.get("csv_path", "TASI_Historical_Data.csv")
+    model_path = model_path or info["linear_model_path"]
+    scaler_path = scaler_path or info["linear_scaler_path"]
+
     print("=" * 60)
-    print("Linear Model Evaluation")
+    print(f"Linear Model Evaluation — {symbol}")
     print("=" * 60)
     print("Loading and preprocessing data...")
 
-    das = DataAcquisitionService(csv_path=csv_path)
-    df = das.load_all()
+    das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
+                                  ticker=info["yfinance_ticker"])
+    df = das.load_all(source="csv" if symbol == "TASI" else "supabase")
 
     # Enrich with VIX + futures
     df = enrich_macro_for_linear(df)
@@ -352,32 +442,46 @@ def run_linear_evaluation(
     y_pred = closes * (1 + pred_returns)
     test_dates = test_df["Date"].values
 
-    # Metrics
+    # ---- Honest metrics: price-space + return-space + naive baseline ----
     print("\n" + "=" * 60)
-    print("TEST SET METRICS (Linear)")
+    print("TEST SET METRICS (Linear) — PRICE SPACE")
     print("=" * 60)
     metrics = compute_metrics(y_actual, y_pred)
     _print_metrics(metrics)
 
-    # Direction accuracy on returns directly
-    dir_acc = (np.sign(pred_returns) == np.sign(actual_returns)).mean() * 100
-    print(f"{'Return Dir Accuracy':<22} {dir_acc:>11.2f}%")
-
-    # Lag check
     print("\n" + "=" * 60)
-    print("LAG CHECK")
+    print("TEST SET METRICS (Linear) — RETURN SPACE  [the honest one]")
     print("=" * 60)
-    if len(y_actual) > 2:
-        naive_pred = y_actual[:-1]
-        naive_mae = np.mean(np.abs(y_actual[1:] - naive_pred))
-        lag_ratio = metrics["MAE"] / naive_mae if naive_mae > 0 else float("inf")
-        print(f"Naive (yesterday) MAE: {naive_mae:.2f} SAR")
-        print(f"Model MAE:             {metrics['MAE']:.2f} SAR")
-        print(f"Ratio (model/naive):   {lag_ratio:.3f}")
+    metrics_returns = compute_metrics_returns(actual_returns, pred_returns)
+    print(f"{'MAE (returns)':<28} {metrics_returns['MAE_returns']:>12.6f}")
+    print(f"{'RMSE (returns)':<28} {metrics_returns['RMSE_returns']:>12.6f}")
+    print(f"{'R² (returns)':<28} {metrics_returns['R2_returns']:>12.4f}")
+    print(f"{'Direction acc (returns)':<28} "
+          f"{metrics_returns['Direction_Accuracy_returns']:>11.2f}%")
+    metrics.update(metrics_returns)
+
+    # Naive baseline (predict tomorrow = today) — both MAE and R²
+    print("\n" + "=" * 60)
+    print("LAG CHECK (naive 'predict tomorrow = today')")
+    print("=" * 60)
+    naive_price = naive_baseline(y_actual)
+    naive_ret = naive_baseline(actual_returns)
+    print(f"Naive MAE (price):     {naive_price['naive_MAE']:.2f} SAR")
+    print(f"Model MAE (price):     {metrics['MAE']:.2f} SAR")
+    print(f"Naive R²  (price):     {naive_price['naive_R2']:.4f}")
+    print(f"Model R²  (price):     {metrics['R2']:.4f}")
+    print(f"Naive R²  (returns):   {naive_ret['naive_R2']:+.4f}")
+    print(f"Model R²  (returns):   {metrics['R2_returns']:+.4f}")
+    if naive_price['naive_MAE'] > 0:
+        lag_ratio = metrics['MAE'] / naive_price['naive_MAE']
+        print(f"Ratio (model/naive MAE): {lag_ratio:.3f}")
         if lag_ratio > 0.95:
             print("[WARN] Predictions may be lagging.")
         else:
-            print("[OK] Model outperforms naive baseline.")
+            print("[OK] Model outperforms naive baseline on price MAE.")
+    metrics["naive_MAE_price"] = naive_price["naive_MAE"]
+    metrics["naive_R2_price"] = naive_price["naive_R2"]
+    metrics["naive_R2_returns"] = naive_ret["naive_R2"]
 
     # Range check
     print("\n" + "=" * 60)
@@ -412,38 +516,51 @@ def run_linear_evaluation(
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate TASI prediction model")
-    parser.add_argument("--csv", default="TASI_Historical_Data.csv")
-    parser.add_argument("--model", default="models/TASI_Model_v3.keras")
-    parser.add_argument("--scaler", default="models/TASI_Scaler_v3.pkl")
-    parser.add_argument("--linear-model", default="models/tasi_linear_model.pkl")
-    parser.add_argument("--linear-scaler", default="models/tasi_linear_scaler.pkl")
+    parser = argparse.ArgumentParser(description="Evaluate prediction models")
+    parser.add_argument("--symbol", default="TASI",
+                        help="Stock symbol (TASI/ARAMCO/RAJHI/SABIC/STC/SECO)")
+    parser.add_argument("--csv", default=None, help="Override CSV (TASI only).")
+    parser.add_argument("--model", default=None, help="Override CNN model path.")
+    parser.add_argument("--scaler", default=None, help="Override CNN scaler path.")
+    parser.add_argument("--linear-model", default=None,
+                        help="Override linear model path.")
+    parser.add_argument("--linear-scaler", default=None,
+                        help="Override linear scaler path.")
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--output-dir", default="models")
     parser.add_argument("--model-type", choices=["cnn", "linear", "all"],
                         default="cnn", help="Which model to evaluate (default: cnn)")
     args = parser.parse_args()
 
+    info = get_stock_info(args.symbol)
+    cnn_model = args.model or info["cnn_model_path"]
+    cnn_scaler = args.scaler or info["cnn_scaler_path"]
+    linear_model = args.linear_model or info["linear_model_path"]
+    linear_scaler = args.linear_scaler or info["linear_scaler_path"]
+
     if args.model_type in ("cnn", "all"):
-        for label, path in [("CNN Model", args.model), ("CNN Scaler", args.scaler)]:
+        for label, path in [("CNN Model", cnn_model), ("CNN Scaler", cnn_scaler)]:
             if not Path(path).exists():
-                print(f"[ERROR] {label} not found at '{path}'. Run train_model.py first.")
+                print(f"[ERROR] {label} not found at '{path}'. "
+                      f"Run train_model.py --symbol {args.symbol} first.")
                 sys.exit(1)
 
     if args.model_type in ("linear", "all"):
-        for label, path in [("Linear Model", args.linear_model),
-                            ("Linear Scaler", args.linear_scaler)]:
+        for label, path in [("Linear Model", linear_model),
+                            ("Linear Scaler", linear_scaler)]:
             if not Path(path).exists():
-                print(f"[ERROR] {label} not found at '{path}'.")
+                print(f"[ERROR] {label} not found at '{path}'. "
+                      f"Run train_linear.py --symbol {args.symbol} first.")
                 sys.exit(1)
 
     all_metrics = {}
 
     if args.model_type in ("cnn", "all"):
         cnn_metrics = run_cnn_evaluation(
+            symbol=args.symbol,
             csv_path=args.csv,
-            model_path=args.model,
-            scaler_path=args.scaler,
+            model_path=cnn_model,
+            scaler_path=cnn_scaler,
             lookback=args.lookback,
             output_dir=args.output_dir,
         )
@@ -451,9 +568,10 @@ def main():
 
     if args.model_type in ("linear", "all"):
         linear_metrics = run_linear_evaluation(
+            symbol=args.symbol,
             csv_path=args.csv,
-            model_path=args.linear_model,
-            scaler_path=args.linear_scaler,
+            model_path=linear_model,
+            scaler_path=linear_scaler,
             output_dir=args.output_dir,
         )
         all_metrics["Linear"] = linear_metrics
@@ -463,14 +581,28 @@ def main():
         print("\n" + "=" * 60)
         print("MODEL COMPARISON")
         print("=" * 60)
-        print(f"\n{'Metric':<22} {'CNN':>12} {'Linear':>12}")
-        print("-" * 48)
-        for metric in ["MAE", "RMSE", "MAPE", "R2", "Direction_Accuracy"]:
-            unit = "%" if metric in ("MAPE", "Direction_Accuracy") else " SAR"
-            fmt = ".2f" if metric != "R2" else ".4f"
-            cnn_val = all_metrics["CNN"][metric]
-            lin_val = all_metrics["Linear"][metric]
-            print(f"{metric:<22} {cnn_val:>11{fmt}}{unit} {lin_val:>11{fmt}}{unit}")
+        print(f"\n{'Metric':<28} {'CNN':>14} {'Linear':>14}")
+        print("-" * 58)
+        # Price-space (inflated by prev_close — read alongside naive_R2_price)
+        for metric in ["MAE", "RMSE", "MAPE", "R2", "naive_MAE_price",
+                       "naive_R2_price"]:
+            unit = "%" if metric == "MAPE" else " SAR" if metric in (
+                "MAE", "RMSE", "naive_MAE_price") else ""
+            fmt = ".4f" if "R2" in metric else ".2f"
+            cnn_val = all_metrics["CNN"].get(metric, float("nan"))
+            lin_val = all_metrics["Linear"].get(metric, float("nan"))
+            print(f"{metric:<28} {cnn_val:>13{fmt}}{unit} "
+                  f"{lin_val:>13{fmt}}{unit}")
+        # Return-space (the honest signal)
+        print("-" * 58)
+        for metric in ["R2_returns", "Direction_Accuracy_returns",
+                       "naive_R2_returns"]:
+            unit = "%" if "Direction" in metric else ""
+            fmt = ".2f" if "Direction" in metric else ".4f"
+            cnn_val = all_metrics["CNN"].get(metric, float("nan"))
+            lin_val = all_metrics["Linear"].get(metric, float("nan"))
+            print(f"{metric:<28} {cnn_val:>13{fmt}}{unit} "
+                  f"{lin_val:>13{fmt}}{unit}")
 
     print("\n[DONE] Evaluation complete.")
 
