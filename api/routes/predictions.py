@@ -295,6 +295,126 @@ def prediction_accuracy(
     return results[:limit]
 
 
+@router.get("/model-metrics")
+def model_metrics(
+    symbol: str = Query(..., description="Stock symbol (TASI, ARAMCO, etc)."),
+    model_id: int = Query(..., description="ai_models.model_id"),
+):
+    """Rolling deployed-performance metrics for one (symbol, model) pair.
+
+    Computed live from `model_accuracy_log` joined with `ai_predictions` so
+    the numbers always reflect what this exact model has actually done on
+    this exact stock. New predictions and freshly-validated rows flow in
+    without any extra plumbing.
+
+    Direction accuracy compares sign(predicted - prev_close) vs
+    sign(actual - prev_close), where prev_close is the market_data row
+    immediately before target_date. Days where the prev-close lookup fails
+    are excluded from the direction count but still count for MAPE.
+    """
+    sb = get_client()
+
+    preds = (sb.table("ai_predictions")
+             .select("prediction_id,target_date,predicted_close")
+             .eq("symbol", symbol)
+             .eq("model_id", model_id)
+             .execute())
+    if not preds.data:
+        return {
+            "symbol": symbol,
+            "model_id": model_id,
+            "n_predictions": 0,
+            "mape_pct": 0.0,
+            "direction_accuracy_pct": 0.0,
+            "best_error_pct": 0.0,
+            "worst_error_pct": 0.0,
+            "last_validated_date": None,
+        }
+
+    pred_by_id = {p["prediction_id"]: p for p in preds.data}
+
+    logs = (sb.table("model_accuracy_log")
+            .select("prediction_id,actual_close,error_percentage")
+            .in_("prediction_id", list(pred_by_id.keys()))
+            .execute())
+    if not logs.data:
+        return {
+            "symbol": symbol,
+            "model_id": model_id,
+            "n_predictions": 0,
+            "mape_pct": 0.0,
+            "direction_accuracy_pct": 0.0,
+            "best_error_pct": 0.0,
+            "worst_error_pct": 0.0,
+            "last_validated_date": None,
+        }
+
+    # One range query for market_data, indexed by date in memory.
+    target_dates = sorted({pred_by_id[l["prediction_id"]]["target_date"]
+                           for l in logs.data
+                           if l["prediction_id"] in pred_by_id})
+    md = (sb.table("market_data")
+          .select("date,close")
+          .eq("symbol", symbol)
+          .lte("date", target_dates[-1])
+          .gte("date", target_dates[0])
+          .order("date")
+          .execute())
+    closes_by_date = {row["date"]: row["close"] for row in (md.data or [])}
+    sorted_md_dates = sorted(closes_by_date.keys())
+
+    def prev_close_for(target: str):
+        """Find the market_data close on the trading day immediately before
+        target_date. Returns None if no such row exists in range."""
+        candidate = None
+        for d in sorted_md_dates:
+            if d < target:
+                candidate = d
+            else:
+                break
+        return closes_by_date.get(candidate) if candidate else None
+
+    errors = []
+    direction_hits = 0
+    direction_total = 0
+    last_validated = None
+
+    for log in logs.data:
+        p = pred_by_id.get(log["prediction_id"])
+        if not p:
+            continue
+        err = float(log["error_percentage"])
+        errors.append(err)
+
+        target = p["target_date"]
+        if last_validated is None or target > last_validated:
+            last_validated = target
+
+        prev_close = prev_close_for(target)
+        if prev_close and prev_close > 0:
+            pred_up = p["predicted_close"] > prev_close
+            actual_up = log["actual_close"] > prev_close
+            direction_total += 1
+            if pred_up == actual_up:
+                direction_hits += 1
+
+    n = len(errors)
+    mape = sum(errors) / n
+    return {
+        "symbol": symbol,
+        "model_id": model_id,
+        "n_predictions": n,
+        "mape_pct": round(mape, 2),
+        "direction_accuracy_pct": (
+            round(direction_hits / direction_total * 100, 1)
+            if direction_total else 0.0
+        ),
+        "best_error_pct": round(min(errors), 2),
+        "worst_error_pct": round(max(errors), 2),
+        "last_validated_date": last_validated,
+    }
+
+
 @router.get("/models")
 def list_models():
     """List all registered AI models."""
