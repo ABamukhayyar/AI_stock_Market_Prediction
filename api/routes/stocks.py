@@ -40,27 +40,44 @@ def _format_volume(vol: int) -> str:
 def _build_model_predictions(
     sb, symbol: str, latest_close: float, sentiment_row: dict | None,
     models_data: list,
+    *,
+    latest_pred_by_key: dict | None = None,
+    avg_error_by_key: dict | None = None,
 ) -> list:
     """Return [{model_id, model_name, predicted_close, change, confidence,
     target_date, trend}] sorted by confidence desc. Empty when no model has
-    a prediction for this symbol yet."""
+    a prediction for this symbol yet.
+
+    When `latest_pred_by_key` (mapping (symbol, model_id) -> prediction row)
+    and `avg_error_by_key` (mapping (model_id, symbol) -> avg error_pct, with
+    missing keys meaning "no validated history yet") are supplied, the
+    helper performs no DB queries -- it walks the caches. Used by the list
+    endpoints to avoid N x M round-trips. When the caches are None, falls
+    back to per-call DB lookups (the single-stock path).
+    """
     from prediction.confidence import compute_confidence
 
     results = []
+    use_cache = latest_pred_by_key is not None
     for m in models_data:
         mid = m["model_id"]
-        pred = (sb.table("ai_predictions").select("*")
-                .eq("symbol", symbol)
-                .eq("model_id", mid)
-                .order("execution_date", desc=True)
-                .limit(1)
-                .execute())
-        if not pred.data:
-            continue
-        p = pred.data[0]
+        if use_cache:
+            p = latest_pred_by_key.get((symbol, mid))
+            if not p:
+                continue
+        else:
+            pred = (sb.table("ai_predictions").select("*")
+                    .eq("symbol", symbol)
+                    .eq("model_id", mid)
+                    .order("execution_date", desc=True)
+                    .limit(1)
+                    .execute())
+            if not pred.data:
+                continue
+            p = pred.data[0]
         predicted = p["predicted_close"]
         change = round((predicted - latest_close) / latest_close * 100, 2) if latest_close else 0.0
-        conf = compute_confidence(
+        conf_kwargs = dict(
             model_id=mid,
             predicted_close=predicted,
             latest_close=latest_close,
@@ -68,6 +85,9 @@ def _build_model_predictions(
             sentiment_confidence=(sentiment_row or {}).get("confidence"),
             symbol=symbol,
         )
+        if avg_error_by_key is not None:
+            conf_kwargs["avg_error"] = avg_error_by_key.get((mid, symbol))
+        conf = compute_confidence(**conf_kwargs)
         results.append({
             "model_id": mid,
             "model_name": _clean_model_name(m.get("type", "Unknown")),
@@ -209,31 +229,71 @@ def list_stocks():
     models = sb.table("ai_models").select("model_id,model_name,type").execute()
     models_data = models.data or []
 
+    # Bulk-fetch everything that powers the per-(stock, model) confidence
+    # numbers so the per-stock loop doesn't fan out into N x M round-trips.
+    # Without this, on a hosted Supabase + Windows client we hit socket
+    # exhaustion (WinError 10035) and the endpoint returns 500 after ~20s.
+    all_preds = (sb.table("ai_predictions")
+                 .select("prediction_id,symbol,model_id,predicted_close,"
+                         "target_date,execution_date")
+                 .execute())
+    latest_pred_by_key = {}
+    for p in (all_preds.data or []):
+        key = (p["symbol"], p["model_id"])
+        existing = latest_pred_by_key.get(key)
+        if existing is None or p["execution_date"] > existing["execution_date"]:
+            latest_pred_by_key[key] = p
+    log_index = {l["prediction_id"]: l["error_percentage"]
+                 for l in (sb.table("model_accuracy_log")
+                           .select("prediction_id,error_percentage")
+                           .execute().data or [])}
+    errors_by_key = {}
+    for p in (all_preds.data or []):
+        err = log_index.get(p["prediction_id"])
+        if err is not None:
+            errors_by_key.setdefault((p["model_id"], p["symbol"]), []).append(err)
+    avg_error_by_key = {k: sum(v) / len(v) for k, v in errors_by_key.items()}
+
+    # Bulk-fetch market_data and sentiment for all symbols at once, then
+    # group in memory. Cuts another N round-trips.
+    all_symbols = [s["symbol"] for s in stocks.data]
+    md_rows = (sb.table("market_data")
+               .select("symbol,date,open,high,low,close,volume")
+               .in_("symbol", all_symbols)
+               .order("date", desc=True)
+               .limit(252 * len(all_symbols) + 100)
+               .execute().data or [])
+    md_by_symbol = {}
+    for row in md_rows:
+        md_by_symbol.setdefault(row["symbol"], []).append(row)
+        # rows arrive sorted DESC across all symbols; per-symbol DESC order is
+        # preserved because for any single symbol they remain in the same
+        # relative order. Trim to 252 below to keep parity with the old query.
+    sent_rows = (sb.table("sentiment_analysis")
+                 .select("symbol,date,sentiment_label,sentiment_score,confidence")
+                 .in_("symbol", all_symbols)
+                 .order("date", desc=True)
+                 .limit(len(all_symbols) * 30)
+                 .execute().data or [])
+    sent_by_symbol = {}
+    for row in sent_rows:
+        # First row per symbol (DESC) is the latest; ignore subsequent ones.
+        sent_by_symbol.setdefault(row["symbol"], row)
+
     results = []
     for stock in stocks.data:
         symbol = stock["symbol"]
-
-        md = (sb.table("market_data").select("*")
-              .eq("symbol", symbol)
-              .order("date", desc=True)
-              .limit(252)
-              .execute())
-
-        sent = (sb.table("sentiment_analysis").select("*")
-                .eq("symbol", symbol)
-                .order("date", desc=True)
-                .limit(1)
-                .execute())
-
-        latest_close = md.data[0]["close"] if md.data else 0
-        sentiment_row = sent.data[0] if sent.data else None
+        md_data = md_by_symbol.get(symbol, [])[:252]
+        sentiment_row = sent_by_symbol.get(symbol)
+        latest_close = md_data[0]["close"] if md_data else 0
         model_preds = _build_model_predictions(
             sb, symbol, latest_close, sentiment_row, models_data,
+            latest_pred_by_key=latest_pred_by_key,
+            avg_error_by_key=avg_error_by_key,
         )
-
         enriched = _enrich_stock(
             stock,
-            md.data or [],
+            md_data,
             None,
             sentiment_row,
             model_predictions=model_preds,
@@ -273,6 +333,33 @@ def batch_stocks(ids: str = Query(..., description="Comma-separated stock IDs"))
     models = sb.table("ai_models").select("model_id,model_name,type").execute()
     models_data = models.data or []
 
+    # Same bulk-fetch pattern as list_stocks (see comment there).
+    preds_query = (sb.table("ai_predictions")
+                   .select("prediction_id,symbol,model_id,predicted_close,"
+                           "target_date,execution_date")
+                   .in_("symbol", id_list))
+    all_preds = preds_query.execute()
+    latest_pred_by_key = {}
+    for p in (all_preds.data or []):
+        key = (p["symbol"], p["model_id"])
+        existing = latest_pred_by_key.get(key)
+        if existing is None or p["execution_date"] > existing["execution_date"]:
+            latest_pred_by_key[key] = p
+    pred_ids = [p["prediction_id"] for p in (all_preds.data or [])]
+    log_index = {}
+    if pred_ids:
+        log_index = {l["prediction_id"]: l["error_percentage"]
+                     for l in (sb.table("model_accuracy_log")
+                               .select("prediction_id,error_percentage")
+                               .in_("prediction_id", pred_ids)
+                               .execute().data or [])}
+    errors_by_key = {}
+    for p in (all_preds.data or []):
+        err = log_index.get(p["prediction_id"])
+        if err is not None:
+            errors_by_key.setdefault((p["model_id"], p["symbol"]), []).append(err)
+    avg_error_by_key = {k: sum(v) / len(v) for k, v in errors_by_key.items()}
+
     results = []
     for symbol in id_list:
         stock = sb.table("stocks").select("*").eq("symbol", symbol).execute()
@@ -295,6 +382,8 @@ def batch_stocks(ids: str = Query(..., description="Comma-separated stock IDs"))
         sentiment_row = sent.data[0] if sent.data else None
         model_preds = _build_model_predictions(
             sb, symbol, latest_close, sentiment_row, models_data,
+            latest_pred_by_key=latest_pred_by_key,
+            avg_error_by_key=avg_error_by_key,
         )
 
         enriched = _enrich_stock(
@@ -346,8 +435,39 @@ def get_stock(stock_id: str):
 
     latest_close = md.data[0]["close"] if md.data else 0
     sentiment_row = sent.data[0] if sent.data else None
+
+    # Same bulk-fetch pattern, scoped to this one symbol since it's a
+    # detail-page query. Still avoids the inner per-model round-trips.
+    preds_for_symbol = (sb.table("ai_predictions")
+                        .select("prediction_id,symbol,model_id,predicted_close,"
+                                "target_date,execution_date")
+                        .eq("symbol", stock_id)
+                        .execute())
+    latest_pred_by_key = {}
+    for p in (preds_for_symbol.data or []):
+        key = (p["symbol"], p["model_id"])
+        existing = latest_pred_by_key.get(key)
+        if existing is None or p["execution_date"] > existing["execution_date"]:
+            latest_pred_by_key[key] = p
+    pred_ids = [p["prediction_id"] for p in (preds_for_symbol.data or [])]
+    avg_error_by_key = {}
+    if pred_ids:
+        log_rows = (sb.table("model_accuracy_log")
+                    .select("prediction_id,error_percentage")
+                    .in_("prediction_id", pred_ids)
+                    .execute().data or [])
+        log_index = {l["prediction_id"]: l["error_percentage"] for l in log_rows}
+        errors_by_key = {}
+        for p in (preds_for_symbol.data or []):
+            err = log_index.get(p["prediction_id"])
+            if err is not None:
+                errors_by_key.setdefault((p["model_id"], p["symbol"]), []).append(err)
+        avg_error_by_key = {k: sum(v) / len(v) for k, v in errors_by_key.items()}
+
     model_preds = _build_model_predictions(
         sb, stock_id, latest_close, sentiment_row, models_data,
+        latest_pred_by_key=latest_pred_by_key,
+        avg_error_by_key=avg_error_by_key,
     )
 
     result = _enrich_stock(

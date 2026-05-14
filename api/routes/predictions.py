@@ -110,64 +110,108 @@ def latest_predictions(symbol: str = Query(default="TASI")):
     """Get one prediction per stock for Dashboard (Option A).
 
     Averages predictions across models and computes a real confidence score.
+
+    Bulk-fetched: previously this endpoint did N stocks x M models = O(NxM)
+    round-trips to Supabase, which on a hosted DB exhausted the Windows
+    socket pool and started returning 500s. Now we fetch ai_models,
+    ai_predictions, and model_accuracy_log once each, index in memory, and
+    only round-trip per-stock for market_data + sentiment.
     """
+    from prediction.confidence import compute_confidence
+
     sb = get_client()
 
-    # Get all active stocks
     stocks = sb.table("stocks").select("*").eq("is_active", True).execute()
     if not stocks.data:
         return []
 
+    models = sb.table("ai_models").select("model_id,type,model_name").execute()
+    models_data = models.data or []
+    if not models_data:
+        return []
+
+    # One bulk pull of ai_predictions, then pick the latest per (symbol, model_id).
+    all_preds = (sb.table("ai_predictions")
+                 .select("prediction_id,symbol,model_id,predicted_close,target_date,execution_date")
+                 .execute())
+    latest_pred_by_key = {}  # (symbol, model_id) -> prediction row
+    for p in (all_preds.data or []):
+        key = (p["symbol"], p["model_id"])
+        existing = latest_pred_by_key.get(key)
+        if existing is None or p["execution_date"] > existing["execution_date"]:
+            latest_pred_by_key[key] = p
+
+    # One bulk pull of model_accuracy_log, joined client-side with the
+    # predictions above to build (model_id, symbol) -> avg error_percentage.
+    log_index = {l["prediction_id"]: l["error_percentage"]
+                 for l in (sb.table("model_accuracy_log")
+                           .select("prediction_id,error_percentage")
+                           .execute().data or [])}
+    errors_by_key = {}  # (model_id, symbol) -> list[error_percentage]
+    for p in (all_preds.data or []):
+        err = log_index.get(p["prediction_id"])
+        if err is not None:
+            errors_by_key.setdefault((p["model_id"], p["symbol"]), []).append(err)
+    avg_error_by_key = {
+        k: sum(v) / len(v) for k, v in errors_by_key.items()
+    }
+
+    # Bulk-fetch latest close per stock and latest sentiment per stock in
+    # one query each, then index by symbol. Same trick as in /stocks.
+    all_symbols = [s["symbol"] for s in stocks.data]
+    md_rows = (sb.table("market_data")
+               .select("symbol,date,close")
+               .in_("symbol", all_symbols)
+               .order("date", desc=True)
+               .limit(len(all_symbols) * 30)
+               .execute().data or [])
+    latest_close_by_symbol = {}
+    for row in md_rows:
+        latest_close_by_symbol.setdefault(row["symbol"], row["close"])
+    sent_rows = (sb.table("sentiment_analysis")
+                 .select("symbol,date,sentiment_label,sentiment_score,confidence")
+                 .in_("symbol", all_symbols)
+                 .order("date", desc=True)
+                 .limit(len(all_symbols) * 30)
+                 .execute().data or [])
+    sent_by_symbol = {}
+    for row in sent_rows:
+        sent_by_symbol.setdefault(row["symbol"], row)
+
     results = []
     for stock_row in stocks.data:
         sym = stock_row["symbol"]
+        latest_close = latest_close_by_symbol.get(sym, 0)
+        sentiment = sent_by_symbol.get(sym)
+        sent_score = sentiment.get("sentiment_score") if sentiment else None
+        sent_conf = sentiment.get("confidence") if sentiment else None
 
-        # Latest market data
-        md = (sb.table("market_data").select("close,date")
-              .eq("symbol", sym)
-              .order("date", desc=True)
-              .limit(1)
-              .execute())
-        latest_close = md.data[0]["close"] if md.data else 0
-
-        # Latest sentiment
-        sent = (sb.table("sentiment_analysis").select("*")
-                .eq("symbol", sym)
-                .order("date", desc=True)
-                .limit(1)
-                .execute())
-        sentiment = sent.data[0] if sent.data else None
-
-        # Get all models
-        models = sb.table("ai_models").select("*").execute()
-        if not models.data:
-            continue
-
-        # Collect predictions from all models
+        # Walk the in-memory caches instead of N more DB calls.
         model_preds = []
-        for model in models.data:
-            pred = (sb.table("ai_predictions").select("*")
-                    .eq("symbol", sym)
-                    .eq("model_id", model["model_id"])
-                    .order("execution_date", desc=True)
-                    .limit(1)
-                    .execute())
-            if pred.data:
-                confidence = _compute_confidence(
-                    model["model_id"], pred.data[0]["predicted_close"],
-                    latest_close, sentiment, symbol=sym,
-                )
-                model_preds.append({
-                    "predicted": pred.data[0]["predicted_close"],
-                    "confidence": confidence,
-                    "model_name": _clean_model_name(model.get("type", "Unknown")),
-                    "target_date": pred.data[0]["target_date"],
-                })
+        for m in models_data:
+            mid = m["model_id"]
+            pred = latest_pred_by_key.get((sym, mid))
+            if not pred:
+                continue
+            confidence = compute_confidence(
+                model_id=mid,
+                predicted_close=pred["predicted_close"],
+                latest_close=latest_close,
+                sentiment_score=sent_score,
+                sentiment_confidence=sent_conf,
+                symbol=sym,
+                avg_error=avg_error_by_key.get((mid, sym)),  # None when no validated history yet
+            )
+            model_preds.append({
+                "predicted": pred["predicted_close"],
+                "confidence": confidence,
+                "model_name": _clean_model_name(m.get("type", "Unknown")),
+                "target_date": pred["target_date"],
+            })
 
         if not model_preds:
             continue
 
-        # Pick the model with highest confidence as primary
         best = max(model_preds, key=lambda x: x["confidence"])
         avg_predicted = round(sum(p["predicted"] for p in model_preds) / len(model_preds), 2)
         avg_confidence = round(sum(p["confidence"] for p in model_preds) / len(model_preds))
