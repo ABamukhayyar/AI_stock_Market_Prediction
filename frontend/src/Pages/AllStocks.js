@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import SearchInput from '../components/SearchInput';
 import { BackButton } from '../components/buttons';
-import { MODEL_COLORS, fetchStocks } from '../StockData';
+import { MODEL_COLORS, fetchStocks, formatTargetDateShort } from '../StockData';
 import { useLanguage } from '../LanguageContext';
 import useSmartBack from '../hooks/useSmartBack';
 import useWatchlist from '../hooks/useWatchlist';
@@ -96,6 +96,34 @@ function SectorChip({ label, count, active, onClick, isDark }) {
   );
 }
 
+function ModelChip({ label, count, active, onClick, isDark }) {
+  const accent = MODEL_COLORS[label] || { bg: 'rgba(148,163,184,0.18)', color: '#64748b' };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        borderRadius: 999,
+        padding: '8px 13px',
+        border: `1px solid ${active ? accent.color : (isDark ? 'rgba(148,163,184,0.2)' : 'rgba(148,163,184,0.35)')}`,
+        background: active ? accent.bg : (isDark ? '#1e293b' : '#fff'),
+        color: active ? accent.color : (isDark ? '#cbd5e1' : '#4b5563'),
+        fontSize: 12,
+        fontWeight: 700,
+        cursor: 'pointer',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        whiteSpace: 'nowrap',
+        transition: 'all 0.18s ease',
+      }}
+    >
+      {label}
+      <span style={{ fontSize: 10, color: active ? accent.color : '#94a3b8' }}>{count}</span>
+    </button>
+  );
+}
+
 function ConfidenceRing({ value, size = 46, animate = false, isDark = false }) {
   const r = size / 2 - 4;
   const circ = 2 * Math.PI * r;
@@ -170,11 +198,19 @@ function MiniSparkline({ up }) {
 function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
   const [hovered, setHovered] = useState(false);
   const [visible, setVisible] = useState(false);
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
+  const empty = stock._empty;
   const up = stock.trend === 'up';
-  const pctAbs = Math.abs(stock.change).toFixed(2);
+  const targetDate = stock.target_date && !empty
+    ? formatTargetDateShort(stock.target_date, lang)
+    : null;
+  const pctAbs = Math.abs(stock.change || 0).toFixed(2);
   const glow = up ? 'rgba(11,99,67,0.18)' : 'rgba(197,48,48,0.18)';
-  const barColor = up ? 'linear-gradient(90deg,#0b6343,#22c55e)' : 'linear-gradient(90deg,#c53030,#ef4444)';
+  const barColor = empty
+    ? 'linear-gradient(90deg,#94a3b8,#cbd5e1)'
+    : up
+      ? 'linear-gradient(90deg,#0b6343,#22c55e)'
+      : 'linear-gradient(90deg,#c53030,#ef4444)';
   const model = MODEL_COLORS[stock.model] || { bg: '#eee', color: '#555' };
 
   useEffect(() => {
@@ -276,18 +312,34 @@ function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
         </div>
       </div>
 
-      <span
-        style={{
-          fontSize: 9,
-          color: '#b0bac4',
-          fontWeight: 700,
-          textTransform: 'uppercase',
-          letterSpacing: 0.8,
-          marginBottom: 3,
-        }}
-      >
-        {t('predictedClose')}
-      </span>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
+        <span
+          style={{
+            fontSize: 9,
+            color: '#b0bac4',
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: 0.8,
+          }}
+        >
+          {t('predictedClose')}
+        </span>
+        {targetDate && (
+          <span
+            style={{
+              fontSize: 9.5,
+              color: isDark ? '#cbd5e1' : '#475569',
+              fontWeight: 700,
+              padding: '2px 6px',
+              borderRadius: 6,
+              background: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9',
+              letterSpacing: 0.2,
+            }}
+          >
+            {t('predictedFor')} {targetDate}
+          </span>
+        )}
+      </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 5, marginBottom: 9 }}>
         <span style={{ fontSize: 10, fontWeight: 700, color: '#9ca3af', letterSpacing: 1 }}>SAR</span>
         <span
@@ -295,17 +347,17 @@ function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
           style={{
             fontSize: 29,
             fontWeight: 700,
-            color: isDark ? '#f8fafc' : '#0f1923',
+            color: empty ? '#94a3b8' : (isDark ? '#f8fafc' : '#0f1923'),
             fontFamily: "Georgia, 'Times New Roman', serif",
             letterSpacing: '-0.5px',
             lineHeight: 1,
             transition: 'text-shadow 0.3s',
-            textShadow: hovered
+            textShadow: !empty && hovered
               ? `0 0 20px ${up ? 'rgba(11,99,67,0.24)' : 'rgba(197,48,48,0.24)'}`
               : 'none',
           }}
         >
-          {stock.predicted.toFixed(2)}
+          {empty ? '—' : stock.predicted.toFixed(2)}
         </span>
       </div>
 
@@ -325,11 +377,17 @@ function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
             {t('predictedChange')}
           </span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ fontSize: 12, fontWeight: 800, color: up ? '#0b6343' : '#c53030' }}>{up ? '+' : '-'}{pctAbs}%</span>
-            <span style={{ fontSize: 10.5, color: '#9aa6b2' }}>vs {stock.vs.toFixed(2)}</span>
+            {empty ? (
+              <span style={{ fontSize: 12, fontWeight: 800, color: '#94a3b8' }}>{t('noPredictionForModel')}</span>
+            ) : (
+              <>
+                <span style={{ fontSize: 12, fontWeight: 800, color: up ? '#0b6343' : '#c53030' }}>{up ? '+' : '-'}{pctAbs}%</span>
+                <span style={{ fontSize: 10.5, color: '#9aa6b2' }}>vs {stock.vs.toFixed(2)}</span>
+              </>
+            )}
           </div>
         </div>
-        <MiniSparkline up={up} />
+        {!empty && <MiniSparkline up={up} />}
       </div>
 
       <div
@@ -374,6 +432,7 @@ export default function AllStocks() {
   const [mounted, setMounted] = useState(false);
   const [activeSector, setActiveSector] = useState('All');
   const [sortMode, setSortMode] = useState('gainers');
+  const [selectedModel, setSelectedModel] = useState(null);
   const sectorsRef = useRef(null);
 
   useEffect(() => {
@@ -390,25 +449,69 @@ export default function AllStocks() {
       .catch(() => setLoading(false));
   }, []);
 
+  // Available models across the loaded universe (deduped by display name).
+  const modelOptions = useMemo(() => {
+    const counts = {};
+    enrichedStocks.forEach((s) => {
+      (s.model_predictions || []).forEach((p) => {
+        counts[p.model_name] = (counts[p.model_name] || 0) + 1;
+      });
+    });
+    const known = Object.keys(counts);
+    const preferred = ['CNN-BiLSTM-Attention', 'Linear'];
+    const ordered = [
+      ...preferred.filter((m) => known.includes(m)),
+      ...known.filter((m) => !preferred.includes(m)).sort(),
+    ];
+    return ordered.map((name) => ({ name, count: counts[name] }));
+  }, [enrichedStocks]);
+
+  // Pick a default model once stocks load.
+  useEffect(() => {
+    if (selectedModel || modelOptions.length === 0) return;
+    setSelectedModel(modelOptions[0].name);
+  }, [modelOptions, selectedModel]);
+
+  // Apply per-model overrides so cards render with the chosen model's data.
+  const viewStocks = useMemo(() => {
+    if (!selectedModel) return enrichedStocks;
+    return enrichedStocks.map((s) => {
+      const matches = (s.model_predictions || []).filter((p) => p.model_name === selectedModel);
+      if (matches.length === 0) {
+        return { ...s, _empty: true, confidence: 0, change: 0, predicted: 0 };
+      }
+      const best = matches.reduce((a, b) => (a.confidence >= b.confidence ? a : b));
+      return {
+        ...s,
+        predicted: best.predicted_close,
+        change: best.change,
+        confidence: best.confidence,
+        model: best.model_name,
+        trend: best.trend,
+        target_date: best.target_date,
+      };
+    });
+  }, [enrichedStocks, selectedModel]);
+
   const sectors = useMemo(() => {
-    const unique = Array.from(new Set(enrichedStocks.map((s) => s.sector || 'General'))).sort((a, b) =>
+    const unique = Array.from(new Set(viewStocks.map((s) => s.sector || 'General'))).sort((a, b) =>
       a.localeCompare(b)
     );
     return ['All', ...unique];
-  }, [enrichedStocks]);
+  }, [viewStocks]);
 
   const sectorCounts = useMemo(() => {
-    const counts = { All: enrichedStocks.length };
-    enrichedStocks.forEach((s) => {
+    const counts = { All: viewStocks.length };
+    viewStocks.forEach((s) => {
       const key = s.sector || 'General';
       counts[key] = (counts[key] || 0) + 1;
     });
     return counts;
-  }, [enrichedStocks]);
+  }, [viewStocks]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return enrichedStocks
+    return viewStocks
       .filter((s) => (activeSector === 'All' ? true : (s.sector || 'General') === activeSector))
       .filter((s) => {
         if (!q) return true;
@@ -419,14 +522,23 @@ export default function AllStocks() {
         );
       })
       .sort((a, b) => {
+        // Empty cards (no prediction for selected model) sink to the bottom.
+        if (a._empty && !b._empty) return 1;
+        if (!a._empty && b._empty) return -1;
         if (sortMode === 'gainers') return b.change - a.change;
         if (sortMode === 'losers') return a.change - b.change;
         return b.change - a.change;
       });
-  }, [enrichedStocks, query, activeSector, sortMode]);
+  }, [viewStocks, query, activeSector, sortMode]);
 
-  const highestGainer = useMemo(() => [...enrichedStocks].sort((a, b) => b.change - a.change)[0], [enrichedStocks]);
-  const biggestLoser = useMemo(() => [...enrichedStocks].sort((a, b) => a.change - b.change)[0], [enrichedStocks]);
+  const highestGainer = useMemo(
+    () => [...viewStocks].filter((s) => !s._empty).sort((a, b) => b.change - a.change)[0],
+    [viewStocks],
+  );
+  const biggestLoser = useMemo(
+    () => [...viewStocks].filter((s) => !s._empty).sort((a, b) => a.change - b.change)[0],
+    [viewStocks],
+  );
   const orderingText =
     sortMode === 'gainers'
       ? t('orderingGainers')
@@ -579,6 +691,36 @@ export default function AllStocks() {
             </span>
           </div>
         </div>
+
+        {modelOptions.length > 0 && (
+          <div className={`fade-in${mounted ? ' ready' : ''}`} style={{ marginBottom: 14, transitionDelay: '0.06s' }}>
+            <p
+              className="allstocks-muted"
+              style={{
+                fontSize: 12,
+                color: '#8a9aaa',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: 0.8,
+                marginBottom: 8,
+              }}
+            >
+              {t('sortByModel')}
+            </p>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {modelOptions.map((m) => (
+                <ModelChip
+                  key={m.name}
+                  label={m.name}
+                  count={m.count}
+                  active={m.name === selectedModel}
+                  onClick={() => setSelectedModel(m.name)}
+                  isDark={isDark}
+                />
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className={`fade-in${mounted ? ' ready' : ''}`} style={{ marginBottom: 18, transitionDelay: '0.1s' }}>
             <p

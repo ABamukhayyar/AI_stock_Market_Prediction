@@ -12,6 +12,32 @@ export const MODEL_COLORS = {
 
 const API_BASE = '/api';
 
+/** Format an ISO date string (YYYY-MM-DD) as "May 15, 2026" / "15 مايو 2026". */
+export function formatTargetDate(iso, lang = 'en') {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const locale = lang === 'ar' ? 'ar-SA' : 'en-US';
+  try {
+    return d.toLocaleDateString(locale, { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch {
+    return iso;
+  }
+}
+
+/** Shorter form: "May 15" / "15 مايو" for compact card labels. */
+export function formatTargetDateShort(iso, lang = 'en') {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const locale = lang === 'ar' ? 'ar-SA' : 'en-US';
+  try {
+    return d.toLocaleDateString(locale, { month: 'short', day: 'numeric' });
+  } catch {
+    return iso;
+  }
+}
+
 export async function fetchStocks() {
   const res = await fetch(`${API_BASE}/stocks`);
   if (!res.ok) throw new Error('Failed to fetch stocks');
@@ -56,4 +82,18 @@ export async function fetchAccuracy(symbol, limit = 50) {
   const res = await fetch(`${API_BASE}/predictions/accuracy?${params.toString()}`);
   if (!res.ok) throw new Error('Failed to fetch accuracy');
   return res.json();
+}
+
+export async function fetchModelMetrics(symbol, modelId) {
+  if (!symbol || modelId == null) return null;
+  const params = new URLSearchParams();
+  params.set('symbol', symbol);
+  params.set('model_id', String(modelId));
+  try {
+    const res = await fetch(`${API_BASE}/predictions/model-metrics?${params.toString()}`);
+    if (!res.ok) return null;
+    return res.json();
+  } catch (_e) {
+    return null;
+  }
 }
