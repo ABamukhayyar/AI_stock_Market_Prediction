@@ -362,6 +362,7 @@ def _persist_metrics_json(
     y_pred: np.ndarray,
     strategy_equity: np.ndarray | None = None,
     buyhold_equity: np.ndarray | None = None,
+    strategy_equity_10bps: np.ndarray | None = None,
 ) -> None:
     """Write a structured metrics JSON next to the evaluation PNGs.
 
@@ -404,6 +405,10 @@ def _persist_metrics_json(
             "buyhold_equity": (
                 [float(v) for v in buyhold_equity[:len(actuals)]]
                 if buyhold_equity is not None else None
+            ),
+            "strategy_equity_10bps": (
+                [float(v) for v in strategy_equity_10bps[:len(actuals)]]
+                if strategy_equity_10bps is not None else None
             ),
         },
     }
@@ -601,15 +606,26 @@ def run_cnn_evaluation(
     print("\n" + "=" * 60)
     print("TRADING SIMULATION (test period) — Strategy vs Buy & Hold")
     print("=" * 60)
-    tm_cnn, strat_eq, buyh_eq = trading_metrics(y_test_returns, y_pred_returns)
+    tm_cnn, strat_eq, buyh_eq = trading_metrics(
+        y_test_returns, y_pred_returns, transaction_cost_bps=0,
+    )
     _print_trading_metrics(tm_cnn)
     _plot_equity_curves(strat_eq, buyh_eq, test_dates, output_dir,
                         prefix="eval_cnn")
     metrics.update(tm_cnn)
 
+    # Cost-adjusted trading sim at 10 bps per side. Stored under suffixed
+    # keys so the Diagnostics page can show both the headline (zero-cost)
+    # and realistic numbers side by side -- panel reviewers see the
+    # transaction-cost assumption isn't hidden.
+    tm_cost, strat_eq_cost, _ = trading_metrics(
+        y_test_returns, y_pred_returns, transaction_cost_bps=10,
+    )
+    metrics.update({f"{k}_10bps": v for k, v in tm_cost.items()})
+
     _persist_metrics_json(
         output_dir, symbol, "CNN", metrics, test_dates,
-        y_actual, y_pred, strat_eq, buyh_eq,
+        y_actual, y_pred, strat_eq, buyh_eq, strat_eq_cost,
     )
 
     # Plots
@@ -769,15 +785,22 @@ def run_linear_evaluation(
     print("\n" + "=" * 60)
     print("TRADING SIMULATION (test period) — Strategy vs Buy & Hold")
     print("=" * 60)
-    tm_lin, strat_eq, buyh_eq = trading_metrics(actual_returns, pred_returns)
+    tm_lin, strat_eq, buyh_eq = trading_metrics(
+        actual_returns, pred_returns, transaction_cost_bps=0,
+    )
     _print_trading_metrics(tm_lin)
     _plot_equity_curves(strat_eq, buyh_eq, test_dates, output_dir,
                         prefix="eval_linear")
     metrics.update(tm_lin)
 
+    tm_cost, strat_eq_cost, _ = trading_metrics(
+        actual_returns, pred_returns, transaction_cost_bps=10,
+    )
+    metrics.update({f"{k}_10bps": v for k, v in tm_cost.items()})
+
     _persist_metrics_json(
         output_dir, symbol, "Linear", metrics, test_dates,
-        y_actual, y_pred, strat_eq, buyh_eq,
+        y_actual, y_pred, strat_eq, buyh_eq, strat_eq_cost,
     )
 
     # Plots

@@ -43,8 +43,9 @@ function fmtNum(v, digits = 2) {
 }
 
 // ── Chart 1: Equity Curve ───────────────────────────────────────────────
-function EquityCurveChart({ dates, strategy, buyhold, isDark, t }) {
+function EquityCurveChart({ dates, strategy, buyhold, strategyTenBps, isDark, t }) {
   if (!strategy || !buyhold || strategy.length < 2) return null;
+  const hasTenBps = Array.isArray(strategyTenBps) && strategyTenBps.length === strategy.length;
 
   const W = 800;
   const H = 300;
@@ -52,7 +53,7 @@ function EquityCurveChart({ dates, strategy, buyhold, isDark, t }) {
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
 
-  const allY = [...strategy, ...buyhold];
+  const allY = [...strategy, ...buyhold, ...(hasTenBps ? strategyTenBps : [])];
   const yMin = Math.min(...allY, 1);
   const yMax = Math.max(...allY);
   const yPad = (yMax - yMin) * 0.08 || 0.05;
@@ -73,12 +74,14 @@ function EquityCurveChart({ dates, strategy, buyhold, isDark, t }) {
   const xLabels = sampleDateLabels(dates.slice(0, strategy.length), 5);
 
   const stratColor = '#3b82f6';
+  const stratTenBpsColor = '#1e40af';  // darker blue for the cost-adjusted line
   const buyColor = isDark ? '#94a3b8' : '#64748b';
   const axisColor = isDark ? '#334155' : '#e5e7eb';
   const textColor = isDark ? '#94a3b8' : '#6b7280';
 
   const stratEnd = strategy[strategy.length - 1];
   const buyEnd = buyhold[buyhold.length - 1];
+  const stratTenBpsEnd = hasTenBps ? strategyTenBps[strategyTenBps.length - 1] : null;
 
   return (
     <svg
@@ -120,26 +123,47 @@ function EquityCurveChart({ dates, strategy, buyhold, isDark, t }) {
             strokeLinecap="round" strokeLinejoin="round" opacity={0.7} />
       <path d={path(strategy)} fill="none" stroke={stratColor} strokeWidth={2.4}
             strokeLinecap="round" strokeLinejoin="round" />
+      {hasTenBps && (
+        <path d={path(strategyTenBps)} fill="none" stroke={stratTenBpsColor}
+              strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+              strokeDasharray="6 4" />
+      )}
 
       <text x={W - padR + 4} y={yAt(stratEnd) + 4}
             style={{ fontSize: 12, fontWeight: 700, fill: stratColor, fontFamily: "'DM Sans', sans-serif" }}>
         {stratEnd.toFixed(2)}×
       </text>
+      {hasTenBps && (
+        <text x={W - padR + 4} y={yAt(stratTenBpsEnd) + 4}
+              style={{ fontSize: 11, fontWeight: 600, fill: stratTenBpsColor, fontFamily: "'DM Sans', sans-serif" }}>
+          {stratTenBpsEnd.toFixed(2)}×
+        </text>
+      )}
       <text x={W - padR + 4} y={yAt(buyEnd) + 4}
             style={{ fontSize: 11, fontWeight: 600, fill: buyColor, fontFamily: "'DM Sans', sans-serif" }}>
         {buyEnd.toFixed(2)}×
       </text>
 
       <g transform={`translate(${padL + 8}, ${padT + 8})`}>
-        <rect width={186} height={42} rx={6}
+        <rect width={210} height={hasTenBps ? 60 : 42} rx={6}
               fill={isDark ? 'rgba(15,23,42,0.72)' : 'rgba(255,255,255,0.85)'}
               stroke={axisColor} />
         <line x1={10} x2={26} y1={15} y2={15} stroke={stratColor} strokeWidth={2.4} />
         <text x={32} y={18} style={{ fontSize: 11, fontWeight: 600, fill: isDark ? '#f1f5f9' : '#111827' }}>
           {t('legendStrategy')}
         </text>
-        <line x1={10} x2={26} y1={32} y2={32} stroke={buyColor} strokeWidth={2} />
-        <text x={32} y={35} style={{ fontSize: 11, fontWeight: 600, fill: isDark ? '#f1f5f9' : '#111827' }}>
+        {hasTenBps && (
+          <>
+            <line x1={10} x2={26} y1={32} y2={32} stroke={stratTenBpsColor}
+                  strokeWidth={2} strokeDasharray="6 4" />
+            <text x={32} y={35} style={{ fontSize: 11, fontWeight: 600, fill: isDark ? '#f1f5f9' : '#111827' }}>
+              {t('legendStrategyTenBps')}
+            </text>
+          </>
+        )}
+        <line x1={10} x2={26} y1={hasTenBps ? 49 : 32} y2={hasTenBps ? 49 : 32}
+              stroke={buyColor} strokeWidth={2} />
+        <text x={32} y={hasTenBps ? 52 : 35} style={{ fontSize: 11, fontWeight: 600, fill: isDark ? '#f1f5f9' : '#111827' }}>
           {t('legendBuyHold')}
         </text>
       </g>
@@ -446,6 +470,11 @@ export default function ModelDiagnostics() {
                        sub={t('vsBuyHold', { value: fmtNum(m.buyhold_sharpe, 2) })}
                        accent={m.strategy_sharpe > m.buyhold_sharpe ? '#22c55e' : '#ef4444'}
                        isDark={isDark} />
+              <StatBox label={t('sharpeTenBps')}
+                       value={fmtNum(m.strategy_sharpe_10bps, 2)}
+                       sub={t('sharpeTenBpsSub')}
+                       accent={m.strategy_sharpe_10bps > (m.buyhold_sharpe_10bps ?? m.buyhold_sharpe) ? '#22c55e' : '#ef4444'}
+                       isDark={isDark} />
               <StatBox label={t('maxDrawdown')}
                        value={`${fmtNum(m.strategy_max_drawdown_pct, 2)}%`}
                        sub={t('vsBH', { value: `${fmtNum(m.buyhold_max_drawdown_pct, 2)}%` })}
@@ -478,6 +507,7 @@ export default function ModelDiagnostics() {
                 dates={s.test_dates}
                 strategy={s.strategy_equity}
                 buyhold={s.buyhold_equity}
+                strategyTenBps={s.strategy_equity_10bps}
                 isDark={isDark}
                 t={t}
               />
@@ -543,7 +573,10 @@ export default function ModelDiagnostics() {
                         lineHeight: 1.5 }}>
               {t('nTestDays', { n: evalData.n_test })}{' '}
               {t('evaluatedOn', { date: formatTargetDate(evalData.evaluated_at?.slice(0, 10), lang) })}{' '}
-              {t('tradingSimCaveat')}
+              {t('tradingSimCaveat', {
+                headline: fmtNum(m.strategy_sharpe, 2),
+                realistic: fmtNum(m.strategy_sharpe_10bps, 2),
+              })}
             </p>
           </>
         )}
