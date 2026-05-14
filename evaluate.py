@@ -169,6 +169,190 @@ def _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval
 
 
 # ======================================================================
+# Trading simulation — financial-usefulness metrics
+# ======================================================================
+
+def trading_metrics(
+    actual_returns: np.ndarray,
+    pred_returns: np.ndarray,
+    transaction_cost_bps: float = 0.0,
+    trading_days_per_year: int = 252,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Simulate trading on the model's predicted returns.
+
+    Strategy: long (+1) when predicted next-day return > 0, flat (0) otherwise.
+    No shorting, no position sizing, no slippage beyond an optional per-side
+    bps cost. Returns financial-usefulness metrics alongside a buy-and-hold
+    baseline computed over the same period, so the comparison reads honestly.
+
+    Parameters
+    ----------
+    actual_returns        : realized next-day returns over the test period.
+    pred_returns          : model-predicted next-day returns (same length).
+    transaction_cost_bps  : per-side cost in basis points charged on position
+                            changes. Default 0 (no costs). Set e.g. 5 to model
+                            a 5 bps each way fee/slippage round-trip.
+    trading_days_per_year : annualisation factor. 252 is the global convention
+                            and close enough for TASI (Sun-Thu ~248/yr).
+
+    Returns
+    -------
+    (metrics_dict, strategy_equity, buyhold_equity)
+        metrics_dict — scalar numbers for stdout + the comparison tables.
+        strategy_equity, buyhold_equity — equity curves for plotting.
+
+    Notes
+    -----
+    Risk-free rate is assumed 0 in the Sharpe calculation. Reasonable for a
+    daily strategy and avoids pulling a SIBOR series the pipeline does not
+    already have. Documented as a methodological choice in the writeup.
+    """
+    n = len(actual_returns)
+    if n < 2:
+        return {}, np.array([1.0]), np.array([1.0])
+
+    # ---- Position: long when predicted up, flat otherwise ----
+    positions = (pred_returns > 0).astype(float)
+
+    # ---- Daily strategy return before costs ----
+    strategy_returns = positions * actual_returns
+
+    # ---- Subtract transaction costs on position changes ----
+    if transaction_cost_bps > 0:
+        position_changes = np.abs(np.diff(positions, prepend=0.0))
+        costs = position_changes * (transaction_cost_bps / 10_000.0)
+        strategy_returns = strategy_returns - costs
+
+    # ---- Equity curves (compounded growth from 1.0) ----
+    strategy_equity = np.cumprod(1.0 + strategy_returns)
+    buyhold_equity = np.cumprod(1.0 + actual_returns)
+
+    # ---- Headline returns ----
+    strat_total = float(strategy_equity[-1] - 1.0)
+    buyh_total = float(buyhold_equity[-1] - 1.0)
+
+    years = n / trading_days_per_year
+    strat_annual = (1 + strat_total) ** (1 / years) - 1 if years > 0 else 0.0
+    buyh_annual = (1 + buyh_total) ** (1 / years) - 1 if years > 0 else 0.0
+
+    # ---- Sharpe (rf = 0) ----
+    def _sharpe(r: np.ndarray) -> float:
+        sd = float(np.std(r))
+        if sd == 0:
+            return 0.0
+        return float(np.mean(r)) / sd * np.sqrt(trading_days_per_year)
+
+    strat_sharpe = _sharpe(strategy_returns)
+    buyh_sharpe = _sharpe(actual_returns)
+
+    # ---- Max drawdown ----
+    def _max_drawdown(equity: np.ndarray) -> float:
+        running_peak = np.maximum.accumulate(equity)
+        # guard against the unlikely all-zero case
+        running_peak = np.where(running_peak == 0, 1e-12, running_peak)
+        drawdown = (equity - running_peak) / running_peak
+        return float(drawdown.min())  # always <= 0, e.g. -0.18 = -18%
+
+    strat_mdd = _max_drawdown(strategy_equity)
+    buyh_mdd = _max_drawdown(buyhold_equity)
+
+    # ---- Trade-level stats ----
+    traded_mask = positions > 0
+    if traded_mask.sum() > 0:
+        hit_rate = float(np.mean(actual_returns[traded_mask] > 0)) * 100
+    else:
+        hit_rate = 0.0
+    n_trades = int(np.abs(np.diff(positions, prepend=0.0)).sum())
+    pct_in_market = float(traded_mask.mean()) * 100
+
+    metrics = {
+        "strategy_total_return_pct": strat_total * 100,
+        "strategy_annual_return_pct": strat_annual * 100,
+        "strategy_sharpe": strat_sharpe,
+        "strategy_max_drawdown_pct": strat_mdd * 100,
+        "buyhold_total_return_pct": buyh_total * 100,
+        "buyhold_annual_return_pct": buyh_annual * 100,
+        "buyhold_sharpe": buyh_sharpe,
+        "buyhold_max_drawdown_pct": buyh_mdd * 100,
+        "hit_rate_traded_pct": hit_rate,
+        "n_trades": n_trades,
+        "pct_days_in_market": pct_in_market,
+        "transaction_cost_bps": transaction_cost_bps,
+    }
+    return metrics, strategy_equity, buyhold_equity
+
+
+def _print_trading_metrics(tm: dict) -> None:
+    """Pretty-print trading simulation: strategy vs buy-and-hold."""
+    if not tm:
+        print("[WARN] Not enough data for trading simulation.")
+        return
+
+    print(f"\n{'Metric':<26} {'Strategy':>14} {'Buy & Hold':>14}")
+    print("-" * 56)
+    print(f"{'Total Return':<26} "
+          f"{tm['strategy_total_return_pct']:>13.2f}% "
+          f"{tm['buyhold_total_return_pct']:>13.2f}%")
+    print(f"{'Annualized Return':<26} "
+          f"{tm['strategy_annual_return_pct']:>13.2f}% "
+          f"{tm['buyhold_annual_return_pct']:>13.2f}%")
+    print(f"{'Sharpe Ratio (rf=0)':<26} "
+          f"{tm['strategy_sharpe']:>14.3f} "
+          f"{tm['buyhold_sharpe']:>14.3f}")
+    print(f"{'Max Drawdown':<26} "
+          f"{tm['strategy_max_drawdown_pct']:>13.2f}% "
+          f"{tm['buyhold_max_drawdown_pct']:>13.2f}%")
+
+    print(f"\n{'Hit rate (traded days)':<26} {tm['hit_rate_traded_pct']:>13.2f}%")
+    print(f"{'% Days in market':<26} {tm['pct_days_in_market']:>13.2f}%")
+    print(f"{'Number of trades':<26} {tm['n_trades']:>14d}")
+    if tm.get("transaction_cost_bps", 0) > 0:
+        print(f"{'Transaction cost (bps)':<26} "
+              f"{tm['transaction_cost_bps']:>14.1f}")
+
+    # Honest verdict — Sharpe is the right comparator
+    if tm["strategy_sharpe"] > tm["buyhold_sharpe"]:
+        print(f"\n[OK] Strategy Sharpe ({tm['strategy_sharpe']:.2f}) beats "
+              f"buy-and-hold ({tm['buyhold_sharpe']:.2f}).")
+    else:
+        print(f"\n[WARN] Strategy Sharpe ({tm['strategy_sharpe']:.2f}) does not "
+              f"beat buy-and-hold ({tm['buyhold_sharpe']:.2f}). "
+              f"Model adds no risk-adjusted value over this test period.")
+
+
+def _plot_equity_curves(
+    strategy_equity: np.ndarray,
+    buyhold_equity: np.ndarray,
+    test_dates,
+    output_dir,
+    prefix: str = "eval",
+) -> None:
+    """Plot strategy and buy-and-hold equity curves on a single axis."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    n = len(strategy_equity)
+    plot_dates = pd.to_datetime(test_dates[:n])
+    ax.plot(plot_dates, strategy_equity,
+            label="Strategy (long when predicted up)", linewidth=1.8)
+    ax.plot(plot_dates, buyhold_equity,
+            label="Buy & Hold", linewidth=1.5, alpha=0.75)
+    ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5,
+               label="Starting capital")
+    ax.set_title(f"Equity Curve — {prefix}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity (start = 1.0)")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    out = output_dir / f"{prefix}_equity_curve.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[INFO] Plot saved: {out}")
+
+
+# ======================================================================
 # CNN Evaluation
 # ======================================================================
 
@@ -351,6 +535,16 @@ def run_cnn_evaluation(
     print(f"Max absolute error:     {errors.max():.2f} SAR")
     print(f"95th percentile error:  {np.percentile(errors, 95):.2f} SAR")
 
+    # Trading simulation — financial-usefulness metrics
+    print("\n" + "=" * 60)
+    print("TRADING SIMULATION (test period) — Strategy vs Buy & Hold")
+    print("=" * 60)
+    tm_cnn, strat_eq, buyh_eq = trading_metrics(y_test_returns, y_pred_returns)
+    _print_trading_metrics(tm_cnn)
+    _plot_equity_curves(strat_eq, buyh_eq, test_dates, output_dir,
+                        prefix="eval_cnn")
+    metrics.update(tm_cnn)
+
     # Plots
     _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval_cnn")
 
@@ -504,6 +698,16 @@ def run_linear_evaluation(
     print(f"Max absolute error:     {errors.max():.2f} SAR")
     print(f"95th percentile error:  {np.percentile(errors, 95):.2f} SAR")
 
+    # Trading simulation — financial-usefulness metrics
+    print("\n" + "=" * 60)
+    print("TRADING SIMULATION (test period) — Strategy vs Buy & Hold")
+    print("=" * 60)
+    tm_lin, strat_eq, buyh_eq = trading_metrics(actual_returns, pred_returns)
+    _print_trading_metrics(tm_lin)
+    _plot_equity_curves(strat_eq, buyh_eq, test_dates, output_dir,
+                        prefix="eval_linear")
+    metrics.update(tm_lin)
+
     # Plots
     _plot_results(y_actual, y_pred, test_dates, errors, output_dir,
                   prefix="eval_linear")
@@ -599,6 +803,21 @@ def main():
                        "naive_R2_returns"]:
             unit = "%" if "Direction" in metric else ""
             fmt = ".2f" if "Direction" in metric else ".4f"
+            cnn_val = all_metrics["CNN"].get(metric, float("nan"))
+            lin_val = all_metrics["Linear"].get(metric, float("nan"))
+            print(f"{metric:<28} {cnn_val:>13{fmt}}{unit} "
+                  f"{lin_val:>13{fmt}}{unit}")
+
+        # Trading simulation — financial usefulness side-by-side
+        print("-" * 58)
+        for metric in ["strategy_total_return_pct",
+                       "strategy_annual_return_pct",
+                       "strategy_sharpe",
+                       "strategy_max_drawdown_pct",
+                       "hit_rate_traded_pct",
+                       "buyhold_sharpe"]:
+            unit = "%" if metric.endswith("_pct") else ""
+            fmt = ".3f" if "sharpe" in metric else ".2f"
             cnn_val = all_metrics["CNN"].get(metric, float("nan"))
             lin_val = all_metrics["Linear"].get(metric, float("nan"))
             print(f"{metric:<28} {cnn_val:>13{fmt}}{unit} "
