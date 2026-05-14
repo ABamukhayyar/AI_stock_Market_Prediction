@@ -32,6 +32,9 @@ notebooks/eda_outputs/
 .DS_Store
 Thumbs.db
 
+# Daily prediction logs (written by scripts/daily_predict.bat)
+logs/
+
 # Old / unused project copies
 AI_stock_Market_Prediction/
 .claude/
