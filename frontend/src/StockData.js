@@ -97,3 +97,18 @@ export async function fetchModelMetrics(symbol, modelId) {
     return null;
   }
 }
+
+/** Offline holdout evaluation metrics + arrays for the Diagnostics page. */
+export async function fetchEvalMetrics(symbol, modelId) {
+  if (!symbol || modelId == null) return null;
+  const params = new URLSearchParams();
+  params.set('symbol', symbol);
+  params.set('model_id', String(modelId));
+  try {
+    const res = await fetch(`${API_BASE}/predictions/eval-metrics?${params.toString()}`);
+    if (!res.ok) return null;
+    return res.json();
+  } catch (_e) {
+    return null;
+  }
+}

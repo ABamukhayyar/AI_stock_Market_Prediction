@@ -306,7 +306,7 @@ function ModelBadge({ model }) {
 // /api/predictions/model-metrics. Updates when the user toggles between
 // models in the switcher above. Empty state when the model has no
 // validated predictions yet (target dates still in the future).
-function ModelMetricsCard({ symbol, modelId, isDark, t }) {
+function ModelMetricsCard({ symbol, modelId, isDark, t, onOpenDiagnostics }) {
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -348,16 +348,37 @@ function ModelMetricsCard({ symbol, modelId, isDark, t }) {
         boxShadow: isDark ? '0 4px 16px rgba(0,0,0,0.3)' : '0 4px 16px rgba(0,0,0,0.02)',
       }}
     >
-      <div style={{ marginBottom: 16 }}>
-        <h3
-          className="stockdetail-surface-title"
-          style={{ fontSize: 13, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 4 }}
-        >
-          {t('modelPerformance')}
-        </h3>
-        <p className="stockdetail-muted" style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#6b7280', margin: 0 }}>
-          {t('modelPerformanceSubtitle')}
-        </p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
+        <div>
+          <h3
+            className="stockdetail-surface-title"
+            style={{ fontSize: 13, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 4 }}
+          >
+            {t('modelPerformance')}
+          </h3>
+          <p className="stockdetail-muted" style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#6b7280', margin: 0 }}>
+            {t('modelPerformanceSubtitle')}
+          </p>
+        </div>
+        {onOpenDiagnostics && (
+          <button
+            type="button"
+            onClick={onOpenDiagnostics}
+            style={{
+              fontSize: 12,
+              fontWeight: 700,
+              color: '#3b82f6',
+              background: 'transparent',
+              border: `1px solid ${isDark ? 'rgba(59,130,246,0.4)' : 'rgba(59,130,246,0.3)'}`,
+              borderRadius: 8,
+              padding: '6px 12px',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            View Diagnostics →
+          </button>
+        )}
       </div>
 
       {loading && (
@@ -837,6 +858,7 @@ export default function StockDetail() {
             modelId={activeModel.model_id}
             isDark={isDark}
             t={t}
+            onOpenDiagnostics={() => navigate(`/stock/${s.id}/diagnostics`)}
           />
         )}
 

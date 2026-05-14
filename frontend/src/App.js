@@ -5,6 +5,7 @@ import LoginPage from './Pages/LoginPage';
 import Dashboard from './Pages/Dashboard';
 import AllStocks from './Pages/AllStocks';
 import StockDetail from './Pages/StockDetail';
+import ModelDiagnostics from './Pages/ModelDiagnostics';
 import SignUp from './Pages/SignUp';
 import ForgotPassword from './Pages/ForgotPassword';
 import { ThemeProvider } from './components/Layout';
@@ -51,6 +52,7 @@ export default function App() {
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/stocks" element={<AllStocks />} />
               <Route path="/stock/:id" element={<StockDetail />} />
+              <Route path="/stock/:id/diagnostics" element={<ModelDiagnostics />} />
               <Route path="/watchlist" element={<WatchlistPage />} />
               <Route path="/profile" element={<Profile />} />
               <Route path="/settings" element={<Settings />} />

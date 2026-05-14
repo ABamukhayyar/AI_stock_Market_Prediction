@@ -352,6 +352,68 @@ def _plot_equity_curves(
     print(f"[INFO] Plot saved: {out}")
 
 
+def _persist_metrics_json(
+    output_dir,
+    symbol: str,
+    model_label: str,
+    metrics: dict,
+    test_dates,
+    y_actual: np.ndarray,
+    y_pred: np.ndarray,
+    strategy_equity: np.ndarray | None = None,
+    buyhold_equity: np.ndarray | None = None,
+) -> None:
+    """Write a structured metrics JSON next to the evaluation PNGs.
+
+    Consumed by the FastAPI `/predictions/eval-metrics` endpoint to power
+    the Model Diagnostics page (offline-holdout numbers + equity curve +
+    predicted-vs-actual scatter + rolling-MAPE chart). All arrays are
+    aligned -- index i in test_dates corresponds to predictions[i],
+    actuals[i], etc.
+    """
+    import json
+    from datetime import datetime
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dates_iso = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in test_dates[:len(y_actual)]]
+    actuals = [float(v) for v in y_actual]
+    predicteds = [float(v) for v in y_pred]
+    error_pct = [
+        float(abs(a - p) / a * 100) if a else 0.0
+        for a, p in zip(actuals, predicteds)
+    ]
+
+    payload = {
+        "symbol": symbol,
+        "model_label": model_label,
+        "evaluated_at": datetime.now().isoformat(timespec="seconds"),
+        "n_test": len(actuals),
+        "metrics": {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+                    for k, v in metrics.items()},
+        "series": {
+            "test_dates": dates_iso,
+            "actual_close": actuals,
+            "predicted_close": predicteds,
+            "error_pct": error_pct,
+            "strategy_equity": (
+                [float(v) for v in strategy_equity[:len(actuals)]]
+                if strategy_equity is not None else None
+            ),
+            "buyhold_equity": (
+                [float(v) for v in buyhold_equity[:len(actuals)]]
+                if buyhold_equity is not None else None
+            ),
+        },
+    }
+
+    out = output_dir / f"metrics_{symbol}_{model_label.lower()}.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[INFO] Metrics JSON saved: {out}")
+
+
 # ======================================================================
 # CNN Evaluation
 # ======================================================================
@@ -545,6 +607,11 @@ def run_cnn_evaluation(
                         prefix="eval_cnn")
     metrics.update(tm_cnn)
 
+    _persist_metrics_json(
+        output_dir, symbol, "CNN", metrics, test_dates,
+        y_actual, y_pred, strat_eq, buyh_eq,
+    )
+
     # Plots
     _plot_results(y_actual, y_pred, test_dates, errors, output_dir, prefix="eval_cnn")
 
@@ -707,6 +774,11 @@ def run_linear_evaluation(
     _plot_equity_curves(strat_eq, buyh_eq, test_dates, output_dir,
                         prefix="eval_linear")
     metrics.update(tm_lin)
+
+    _persist_metrics_json(
+        output_dir, symbol, "Linear", metrics, test_dates,
+        y_actual, y_pred, strat_eq, buyh_eq,
+    )
 
     # Plots
     _plot_results(y_actual, y_pred, test_dates, errors, output_dir,

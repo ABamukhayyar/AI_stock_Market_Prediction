@@ -459,6 +459,65 @@ def model_metrics(
     }
 
 
+@router.get("/eval-metrics")
+def eval_metrics(
+    symbol: str = Query(..., description="Stock symbol (TASI, ARAMCO, etc)."),
+    model_id: int = Query(..., description="ai_models.model_id"),
+):
+    """Offline holdout-evaluation metrics for (symbol, model).
+
+    Reads the JSON written by `evaluate.py` (a `metrics_<symbol>_<cnn|linear>.json`
+    file under `models/eval_*` or `models/`). Returns the numeric metrics
+    plus aligned arrays for the Diagnostics page to plot:
+        - equity_curve (strategy vs buy-and-hold)
+        - predicted vs actual scatter
+        - rolling MAPE over time
+
+    Unlike `/model-metrics`, this is *holdout* data -- frozen by the
+    train/val/test split when the model was evaluated. Hundreds of points,
+    refreshes only when `evaluate.py` is re-run (typically after retrain).
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    sb = get_client()
+    model_row = (sb.table("ai_models").select("type")
+                 .eq("model_id", model_id).execute())
+    if not model_row.data:
+        raise HTTPException(status_code=404,
+                            detail=f"Unknown model_id {model_id}")
+    raw_type = (model_row.data[0].get("type") or "").lower()
+    if "cnn" in raw_type:
+        model_label = "cnn"
+    elif "linear" in raw_type or "elastic" in raw_type or "ridge" in raw_type:
+        model_label = "linear"
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No offline evaluation for model type '{raw_type}'",
+        )
+
+    filename = f"metrics_{symbol}_{model_label}.json"
+    # Search common output locations in priority order.
+    candidates = [
+        Path("models") / "eval_v4" / filename,
+        Path("models") / f"eval_{symbol}" / filename,
+        Path("models") / filename,
+    ]
+    path = next((c for c in candidates if c.exists()), None)
+    if path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"No metrics file for {symbol} / {model_label}. "
+                    f"Run: python evaluate.py --symbol {symbol} "
+                    f"--model-type {model_label}"),
+        )
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 @router.get("/models")
 def list_models():
     """List all registered AI models."""
