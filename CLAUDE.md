@@ -30,9 +30,9 @@ api/                                → FastAPI backend
   routes/auth.py                    → Authentication endpoints
   routes/watchlist.py               → Watchlist endpoints
 frontend/                           → React website
-  src/Pages/                        → Dashboard, StockDetail, AllStocks, etc.
-  src/components/                   → Layout, SearchInput, buttons
-  src/StockData.js                  → API helpers + model colors
+  src/Pages/                        → Dashboard, StockDetail, AllStocks, ModelDiagnostics, etc.
+  src/components/                   → Layout, SearchInput, buttons, StatBox (shared metric tile)
+  src/StockData.js                  → API helpers + MODEL_COLORS + confidenceColor() + date formatters
   src/LanguageContext.js             → EN/AR bilingual translations
 data_acquisition/market_data.py     → DataAcquisitionService (CSV, yfinance API, Supabase)
 preprocessing/engine.py             → PreprocessingEngine (denoise, scale, sequence)
@@ -54,6 +54,7 @@ models/tasi_linear_model.pkl        → Trained Linear model (ElasticNetCV)
 models/tasi_linear_scaler.pkl       → Linear scaler (StandardScaler)
 models/finbert/                     → Cached FinBERT NLP model
 models/opus-mt-ar-en/               → Cached MarianMT translation model
+models/eval_v4/metrics_*.json       → Offline-evaluation JSON per (symbol, model) — feeds the Diagnostics page
 logs/                               → Daily prediction logs (gitignored; created by daily_predict.bat)
 TASI_Historical_Data.csv            → Original CSV backup
 PRESENTATION_GUIDE.md               → Full demo walkthrough + Q&A
@@ -172,6 +173,7 @@ FRONTEND_ISSUES.md                  → Known frontend issues
 | GET | `/api/predictions/models` | List AI models |
 | GET | `/api/predictions/accuracy?symbol=X&limit=N` | Accuracy log filtered by symbol (1–500, default 50), sorted desc |
 | GET | `/api/predictions/model-metrics?symbol=X&model_id=N` | Rolling MAPE + direction accuracy + count + last validated, computed live from `model_accuracy_log` |
+| GET | `/api/predictions/eval-metrics?symbol=X&model_id=N` | Offline holdout-evaluation metrics + equity-curve arrays + predicted-vs-actual + rolling MAPE. Reads `models/eval_v4/metrics_<SYM>_<cnn\|linear>.json` written by `evaluate.py`. Powers the Model Diagnostics page. |
 | POST | `/api/predictions/run` | Trigger new prediction |
 | POST | `/api/auth/signup` | User registration |
 | POST | `/api/auth/login` | User login |
@@ -180,6 +182,10 @@ FRONTEND_ISSUES.md                  → Known frontend issues
 | DELETE | `/api/watchlist` | Remove from watchlist |
 
 The `model_predictions[]` array on `/api/stocks` is what powers the AllStocks page's CNN/Linear toggle and the StockDetail page's model switcher. Entries are deduped by display name (latest `target_date` wins) so multiple registered model_ids sharing a name collapse to one chip per type.
+
+### Performance note
+
+The list endpoints (`/api/stocks`, `/api/stocks/batch`, `/api/predictions/latest`) were doing N×M round-trips to Supabase (N stocks × M models × ~3 queries per (stock, model)), exhausting Windows sockets after ~260 calls and returning 500s after 22 s on `/predictions/latest`. They now bulk-fetch `ai_predictions`, `model_accuracy_log`, `market_data`, and `sentiment_analysis` once each per request, then join in memory. `compute_confidence()` accepts an optional `avg_error` to skip its DB lookup when called in the hot loop. Result: `/stocks` 4.8 s → 1.2 s warm; `/predictions/latest` 22 s timeout → 1.1 s.
 
 ---
 
@@ -232,20 +238,33 @@ python evaluate.py --model-type all        # Both + comparison table
 
 `evaluate.py` also runs a trading simulation per model (long-when-predicted-up, flat otherwise) and reports Sharpe ratio, max drawdown, total/annual return, hit rate, and number of trades against a buy-and-hold baseline. Equity curves are written to `eval_cnn_equity_curve.png` and `eval_linear_equity_curve.png` in the output directory.
 
+The simulation now runs **twice** per model — once with `transaction_cost_bps=0` (headline / optimistic) and once with `transaction_cost_bps=10` (realistic round-trip cost for TASI). Both are persisted to `metrics_<SYM>_<cnn|linear>.json` (under `_10bps`-suffixed keys) so the Model Diagnostics page can show them side by side. The honest takeaway: CNN's edge survives 10 bps transaction costs (TASI 7.50 → 6.27); the Linear models on some stocks go *negative* once costs are included (SABIC 0.39 → −0.17) — which is what a realistic no-edge baseline should look like.
+
+### Model Diagnostics page
+
+`/stock/:id/diagnostics` shows the offline holdout evaluation for the active model: 7 numeric tiles (MAPE, R², Direction Accuracy, headline Sharpe, 10-bps Sharpe, Max Drawdown, Total Return) plus three charts — equity curve (strategy vs buy-and-hold + dashed 10-bps strategy), predicted-vs-actual scatter with y=x diagonal, and rolling 30-day MAPE. All charts are inline SVG (no chart library). Source data is the JSON written by `evaluate.py`; refreshes only on re-run.
+
 ### Daily Scheduling (Windows)
 
-`scripts/daily_predict.bat` is the cron entrypoint. It uses `%~dp0..` to pivot to the repo root regardless of where the repo lives, creates `logs/` on first run, and pipes the run to `logs/predict_YYYYMMDD.log` (filename built via PowerShell `Get-Date -Format yyyyMMdd` for locale safety).
+`scripts/daily_predict.bat` is the cron entrypoint. It runs `predict.py` for **all six stocks** (TASI, ARAMCO, RAJHI, SABIC, STC, SECO) sequentially. TASI runs first with sentiment enabled; the other five reuse that sentiment via `--no-sentiment` so the heavy FinBERT pass only happens once per day. Output is piped to `logs/predict_YYYYMMDD.log` (filename built via PowerShell `Get-Date -Format yyyyMMdd` for locale safety; the naive `%date%` substring trick breaks on non-US locales).
+
+What one daily run refreshes — every table the website reads from:
+- `market_data` — new OHLCV row per stock per trading day (via `DataAcquisitionService.update_supabase()` at the start of each predict.py)
+- `ai_predictions` — one new row per (stock, model) per run
+- `model_accuracy_log` — `_check_past_predictions_accuracy()` runs first and writes the actual close for any past prediction whose `target_date` has now passed. This is what makes confidence rings *grow* over time as evidence accumulates.
+- `sentiment_analysis` — fresh row from today's Google News (under symbol `TASI`, market-wide for v1)
+- `technical_indicators` — last 5 rows upserted per stock
+
+The Diagnostics page is **not** refreshed by this cron — it reads frozen holdout-evaluation JSON files from `evaluate.py`, which is run only after retraining.
 
 Register once in Windows Task Scheduler:
 ```powershell
-schtasks /create /tn "Insight Daily Prediction" `
-  /tr "c:\Users\Admin\Desktop\Grap_Project_Insight\scripts\daily_predict.bat" `
-  /sc WEEKLY /d SUN,MON,TUE,WED,THU /st 17:30 /f
+schtasks /create /tn "Insight Daily Prediction" /tr "c:\Users\Admin\Desktop\Grap_Project_Insight\scripts\daily_predict.bat" /sc WEEKLY /d SUN,MON,TUE,WED,THU /st 17:30 /f
 ```
 
-Trigger: Sun–Thu (Saudi work week) at 17:30 AST. TASI closes 15:00, yfinance EOD ~17:00, 30-min buffer. `_check_past_predictions_accuracy()` runs at the start of every `predict.py` invocation, so the same daily job both predicts tomorrow's close AND validates yesterday's — no second cron needed.
+Trigger: Sun–Thu (Saudi work week) at 17:30 AST. TASI closes 15:00, yfinance EOD ~17:00, 30-min buffer.
 
-Remove with: `schtasks /delete /tn "Insight Daily Prediction" /f`. See `scripts/README.md` for the full Task Scheduler GUI walkthrough.
+Remove with: `schtasks /delete /tn "Insight Daily Prediction" /f`. See `scripts/README.md` for the full Task Scheduler GUI walkthrough and how to add/remove stocks from the schedule.
 
 ---
 
@@ -306,7 +325,9 @@ matplotlib          # Training/evaluation plots
 5. **Phase 5 ✅:** PostgreSQL database (Supabase)
 6. **Phase 6 ✅:** Linear model integrated from AI-models branch
 7. **Phase 7 ✅:** Leakage-free pipeline + honest per-model metrics surface (Model Performance card, rolling /model-metrics endpoint, AllStocks CNN/Linear toggle, target-date labels, past-predictions track record)
-8. **Phase 8 ✅:** Daily scheduled prediction runs (Windows Task Scheduler + scripts/daily_predict.bat)
+8. **Phase 8 ✅:** Daily scheduled prediction runs covering all 6 stocks (Windows Task Scheduler + scripts/daily_predict.bat)
+9. **Phase 9 ✅:** Model Diagnostics page with offline-holdout graphs (equity curve, predicted-vs-actual scatter, rolling MAPE) + cost-adjusted Sharpe alongside the headline so the trading-sim assumption isn't hidden
+10. **Phase 10 ✅:** Backend perf — bulk-fetch refactor cut /stocks 4×, fixed /predictions/latest 500-error timeout
 
 ---
 
@@ -326,15 +347,27 @@ Feature branch `feature/session-changes-integration` lands the following on top 
 | `02cadd4` | `feat(ui)`: StockDetail Model Performance card + active-model-filtered Past Predictions + target-date pills + chart x-axis dates |
 | `d5f9c6b` | `chore(ops)`: daily prediction cron via Windows Task Scheduler |
 | `f4f4fb0` | `fix`: dedupe `model_predictions` by name (keep freshest target_date); locale-safe log filename |
+| `d00a00e` | `perf`: bulk-fetch in list endpoints — `/stocks` 4.8 s → 1.2 s, `/predictions/latest` 22 s timeout → 1.1 s |
+| `ca2918e` | `feat`: Model Diagnostics page (`/stock/:id/diagnostics`) with offline-holdout equity curve, scatter, rolling MAPE + new `/predictions/eval-metrics` endpoint |
+| `58893f2` | `fix(ui)`: deterministic Stock Detail back-button (no more bouncing into Diagnostics), Arabic translations on Diagnostics, shared StatBox component |
+| `874822f` | `feat(eval)`: non-TASI metrics + cost-adjusted (10 bps) Sharpe alongside headline + clearer equity-curve explainer |
+| `1b05da0` | `style(ui)`: calibrated confidence palette (50% now neutral slate, not alarm-red) + softer card borders + better hover shadows |
+| `773908e` | `feat(ops)`: daily refresh now covers all 6 stocks, not just TASI |
 
 Key behavioural changes a reviewer should know about:
 - **No more data leakage:** scaler + IQR bounds fit on training slice only; headline metrics now reported in return-space (honest CNN: MAPE 0.21%, R² 0.9961, Direction 82.74% — these are post-fix numbers).
 - **One confidence number per prediction:** `prediction.confidence.compute_confidence()` is canonical; Dashboard and Stock Detail now agree.
 - **Per-(model, symbol) accuracy scoping:** one stock's track record can no longer inflate another's confidence as Phase 3 stocks are added.
 - **User can audit the model:** Past Predictions table + Model Performance card both surface real `model_accuracy_log` data instead of relying solely on the heuristic Confidence ring.
+- **Model Diagnostics page** surfaces the offline holdout numbers (586-day test set for TASI CNN) alongside the live rolling numbers — so panel reviewers see the rigorous backtest AND the deployed track record without switching context.
+- **Honest Sharpe:** every Diagnostics page shows both the headline (zero-cost) and 10-bps round-trip realistic Sharpe. The CNN's edge survives 10 bps; some Linear baselines go negative after costs — the asymmetry is itself the defence answer to "are these numbers real?".
+- **Calibrated colors:** the AI Confidence ring is no longer alarm-red for any score below 70. 50% is now slate (neutral, no evidence either way), matching the system's actual epistemic state when validated history is sparse.
+- **All 6 stocks daily:** the cron now refreshes ARAMCO/RAJHI/SABIC/STC/SECO alongside TASI, not just TASI.
 
 ### Known follow-ups
 - Some hard-coded fallback confidence numbers may still exist in legacy frontend data; if `/api/predictions/latest` ever returns nothing those constants will surface. Verify before defence.
 - Auth has no JWT validation server-side. Routes accept `user_id` as a query param. Acceptable for a campus demo, not for anything beyond.
 - Frontend watchlist is browser-`localStorage` only; `/api/watchlist` endpoints exist but the UI isn't wired up to them.
-- Sentiment is market-wide (stored under `symbol = "TASI"`), so per-stock predictions for SABIC/STC/etc. share the same TASI sentiment score until Phase 3 sentiment-per-stock lands.
+- **Sentiment is market-wide** (stored under `symbol = "TASI"`), so per-stock predictions for SABIC/STC/etc. share the same TASI sentiment score until Phase 3 sentiment-per-stock lands. Non-TASI cards always show "Neutral" sentiment as a result.
+- **`market_data` may have gaps** for non-TASI symbols on recently-passed dates. When `_check_past_predictions_accuracy()` can't find the actual close for a (symbol, target_date), it silently skips, so non-TASI rolling metrics stay at zero validated predictions. Worth a `[WARN]` log + backfill follow-up so the Model Performance card populates for those stocks.
+- **No walk-forward backtest.** The 88% direction accuracy on TASI CNN is one realisation on a single 586-day holdout. A walk-forward backtest (train on years 1–5, test on year 6, slide forward) would give a more defensible generalisation claim. Not in scope for the current iteration but flagged as a future-work item.
