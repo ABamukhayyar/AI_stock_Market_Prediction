@@ -282,34 +282,61 @@ def run_prediction(
 
 
 @router.get("/accuracy")
-def prediction_accuracy(symbol: str = Query(default="TASI")):
-    """Get accuracy log for past predictions."""
+def prediction_accuracy(
+    symbol: str | None = Query(default=None,
+                               description="Filter by stock symbol (TASI, ARAMCO, etc). "
+                                           "Omit to return all symbols."),
+    limit: int = Query(default=50, ge=1, le=500,
+                       description="Max rows returned (most recent first)."),
+):
+    """Get accuracy log for past predictions, optionally filtered by symbol.
+
+    Each row pairs a stored prediction with the actual close once the target
+    date has passed, plus the percentage error. Frontend uses this to render
+    the per-stock "Past Predictions" history panel and to compute rolling
+    MAPE so the user can see real model performance, not just a heuristic
+    confidence score.
+    """
     sb = get_client()
+
+    # When a symbol is given, first narrow prediction_ids to that symbol so
+    # we don't pull and discard the whole table. When None, fall back to the
+    # all-symbols view.
+    pred_query = sb.table("ai_predictions").select(
+        "prediction_id,symbol,target_date,predicted_close,model_id"
+    )
+    if symbol:
+        pred_query = pred_query.eq("symbol", symbol)
+    preds = pred_query.execute()
+    if not preds.data:
+        return []
+
+    pred_by_id = {p["prediction_id"]: p for p in preds.data}
 
     logs = (sb.table("model_accuracy_log").select(
         "log_id,prediction_id,actual_close,error_percentage"
-    ).execute())
+    ).in_("prediction_id", list(pred_by_id.keys())).execute())
 
     if not logs.data:
         return []
 
-    # Enrich with prediction details
     results = []
     for log in logs.data:
-        pred = (sb.table("ai_predictions").select("*")
-                .eq("prediction_id", log["prediction_id"])
-                .execute())
-        if pred.data:
-            p = pred.data[0]
-            results.append({
-                "target_date": p["target_date"],
-                "predicted_close": round(p["predicted_close"], 2),
-                "actual_close": round(log["actual_close"], 2),
-                "error_pct": round(log["error_percentage"], 2),
-                "model_id": p["model_id"],
-            })
+        p = pred_by_id.get(log["prediction_id"])
+        if not p:
+            continue
+        results.append({
+            "symbol": p["symbol"],
+            "target_date": p["target_date"],
+            "predicted_close": round(p["predicted_close"], 2),
+            "actual_close": round(log["actual_close"], 2),
+            "error_pct": round(log["error_percentage"], 2),
+            "model_id": p["model_id"],
+        })
 
-    return results
+    # Most recent first, then trim
+    results.sort(key=lambda r: r["target_date"], reverse=True)
+    return results[:limit]
 
 
 @router.get("/models")
