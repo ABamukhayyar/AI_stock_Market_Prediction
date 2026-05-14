@@ -77,8 +77,21 @@ def _build_model_predictions(
             "confidence": conf,
             "target_date": p["target_date"],
         })
-    results.sort(key=lambda r: r["confidence"], reverse=True)
-    return results
+
+    # Multiple model_ids can share a display name (e.g. several "Linear"
+    # versions registered as the team retrained). For the user-facing
+    # toggle / switcher we keep only the freshest per name -- the latest
+    # `target_date` wins (most recent prediction). Older registered model
+    # versions remain in the DB and can still be queried directly.
+    freshest = {}
+    for r in results:
+        existing = freshest.get(r["model_name"])
+        if existing is None or r["target_date"] > existing["target_date"]:
+            freshest[r["model_name"]] = r
+
+    deduped = list(freshest.values())
+    deduped.sort(key=lambda r: r["confidence"], reverse=True)
+    return deduped
 
 
 def _enrich_stock(stock_row: dict, market_data: list, prediction: dict = None,
