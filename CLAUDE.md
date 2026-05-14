@@ -38,19 +38,23 @@ data_acquisition/market_data.py     → DataAcquisitionService (CSV, yfinance AP
 preprocessing/engine.py             → PreprocessingEngine (denoise, scale, sequence)
 technical_analysis/indicators.py    → TechnicalAnalysisService (RSI, MACD, ATR, etc.)
 prediction/engine.py                → PredictionEngine (CNN-BiLSTM-Attention model)
+prediction/confidence.py            → Canonical compute_confidence() — single source for 0-100 score
 prediction/linear/features.py       → Linear model feature engineering (51 features)
 prediction/linear/engine.py         → LinearPredictionEngine (ElasticNetCV)
 sentiment/analyzer.py               → SentimentAnalyzer (news fetch, translate, score)
 db/supabase_client.py               → Supabase client (all DB operations + get_or_register_model)
 train_model.py                      → CNN training pipeline
 predict.py                          → CLI prediction (--model-type cnn|linear|all)
-evaluate.py                         → Model evaluation (--model-type cnn|linear|all)
+evaluate.py                         → Model evaluation + trading sim (Sharpe, drawdown, PnL)
+scripts/daily_predict.bat           → Daily cron entrypoint for Windows Task Scheduler
+scripts/README.md                   → Task Scheduler one-time setup instructions
 models/TASI_Model_v3.keras          → Trained CNN model
 models/TASI_Scaler_v3.pkl           → CNN scaler (RobustScaler)
 models/tasi_linear_model.pkl        → Trained Linear model (ElasticNetCV)
 models/tasi_linear_scaler.pkl       → Linear scaler (StandardScaler)
 models/finbert/                     → Cached FinBERT NLP model
 models/opus-mt-ar-en/               → Cached MarianMT translation model
+logs/                               → Daily prediction logs (gitignored; created by daily_predict.bat)
 TASI_Historical_Data.csv            → Original CSV backup
 PRESENTATION_GUIDE.md               → Full demo walkthrough + Q&A
 FRONTEND_ISSUES.md                  → Known frontend issues
@@ -158,7 +162,7 @@ FRONTEND_ISSUES.md                  → Known frontend issues
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
 | GET | `/api/health` | Health check |
-| GET | `/api/stocks` | List all stocks with latest predictions |
+| GET | `/api/stocks` | List all stocks; each includes `model_predictions[]`, `target_date`, `history_dates[]` |
 | GET | `/api/stocks/{id}` | Stock detail + model_predictions for switcher |
 | GET | `/api/stocks/{id}/history` | OHLCV price history |
 | GET | `/api/stocks/list` | Stock universe for search |
@@ -166,7 +170,8 @@ FRONTEND_ISSUES.md                  → Known frontend issues
 | GET | `/api/predictions` | Recent predictions |
 | GET | `/api/predictions/latest` | One prediction per stock (Dashboard) |
 | GET | `/api/predictions/models` | List AI models |
-| GET | `/api/predictions/accuracy` | Accuracy log |
+| GET | `/api/predictions/accuracy?symbol=X&limit=N` | Accuracy log filtered by symbol (1–500, default 50), sorted desc |
+| GET | `/api/predictions/model-metrics?symbol=X&model_id=N` | Rolling MAPE + direction accuracy + count + last validated, computed live from `model_accuracy_log` |
 | POST | `/api/predictions/run` | Trigger new prediction |
 | POST | `/api/auth/signup` | User registration |
 | POST | `/api/auth/login` | User login |
@@ -174,18 +179,26 @@ FRONTEND_ISSUES.md                  → Known frontend issues
 | POST | `/api/watchlist` | Add to watchlist |
 | DELETE | `/api/watchlist` | Remove from watchlist |
 
+The `model_predictions[]` array on `/api/stocks` is what powers the AllStocks page's CNN/Linear toggle and the StockDetail page's model switcher. Entries are deduped by display name (latest `target_date` wins) so multiple registered model_ids sharing a name collapse to one chip per type.
+
 ---
 
 ## Confidence Score Calculation
 
-Computed from multiple factors (0-100):
-- **Base:** 50 points
-- **Historical accuracy:** +0 to +25 (from model_accuracy_log — lower error = higher boost)
-- **Signal strength:** +0 to +15 (larger predicted moves = more decisive)
-- **Sentiment alignment:** -5 to +10 (news agrees with prediction = boost)
-- **Model type:** +0 to +10 (CNN gets bonus for higher historical accuracy)
+Single source of truth: `prediction/confidence.py:compute_confidence()`. Both `predict.py` and `api/routes/predictions.py` are thin adapters that map their own dict shapes to this canonical scorer, so Dashboard and Stock Detail always show the same number for the same prediction.
 
-Stored in DB as 0.0-1.0 (confidence_score column), displayed as 0-100% on frontend.
+Components (0–100):
+- **Base:** 50 points (neutral — confidence has to be earned)
+- **Signal strength:** +0 to +15 (>2%: +15, >1%: +10, >0.3%: +5)
+- **Sentiment alignment:** −5 / +10, only counted when sentiment confidence > 50
+- **Per-(model_id, symbol) historical accuracy** from `model_accuracy_log`:
+  - avg error <0.5%: +30
+  - <1%: +20
+  - <2%: +10
+  - <5%: +5
+  - no validated history yet: +0 (the system refuses to claim confidence it has not earned)
+
+The accuracy lookup is scoped to the exact `(model_id, symbol)` pair so one stock's track record can't inflate another's. Stored in `ai_predictions.confidence_score` as 0.0–1.0, displayed as 0–100% on frontend.
 
 ---
 
@@ -216,6 +229,23 @@ python evaluate.py --model-type cnn        # CNN evaluation
 python evaluate.py --model-type linear     # Linear evaluation
 python evaluate.py --model-type all        # Both + comparison table
 ```
+
+`evaluate.py` also runs a trading simulation per model (long-when-predicted-up, flat otherwise) and reports Sharpe ratio, max drawdown, total/annual return, hit rate, and number of trades against a buy-and-hold baseline. Equity curves are written to `eval_cnn_equity_curve.png` and `eval_linear_equity_curve.png` in the output directory.
+
+### Daily Scheduling (Windows)
+
+`scripts/daily_predict.bat` is the cron entrypoint. It uses `%~dp0..` to pivot to the repo root regardless of where the repo lives, creates `logs/` on first run, and pipes the run to `logs/predict_YYYYMMDD.log` (filename built via PowerShell `Get-Date -Format yyyyMMdd` for locale safety).
+
+Register once in Windows Task Scheduler:
+```powershell
+schtasks /create /tn "Insight Daily Prediction" `
+  /tr "c:\Users\Admin\Desktop\Grap_Project_Insight\scripts\daily_predict.bat" `
+  /sc WEEKLY /d SUN,MON,TUE,WED,THU /st 17:30 /f
+```
+
+Trigger: Sun–Thu (Saudi work week) at 17:30 AST. TASI closes 15:00, yfinance EOD ~17:00, 30-min buffer. `_check_past_predictions_accuracy()` runs at the start of every `predict.py` invocation, so the same daily job both predicts tomorrow's close AND validates yesterday's — no second cron needed.
+
+Remove with: `schtasks /delete /tn "Insight Daily Prediction" /f`. See `scripts/README.md` for the full Task Scheduler GUI walkthrough.
 
 ---
 
@@ -271,7 +301,40 @@ matplotlib          # Training/evaluation plots
 ## Phases
 1. **Phase 1 ✅:** Build CNN-BiLSTM-Attention model for TASI index
 2. **Phase 2 ✅:** Integrate sentiment analysis as additional feature
-3. **Phase 3:** Expand to individual stocks (SABIC, STC, Alrajhi, Almarai)
-4. **Phase 4 ✅ (partial):** FastAPI backend built + React frontend integrated
-5. **Phase 5 ✅:** Implement PostgreSQL database (Supabase)
+3. **Phase 3 ✅ (partial):** Expand to individual stocks (SABIC, STC, Alrajhi, Almarai, Aramco backfilled — multi-stock backfill landed; per-stock retraining pending)
+4. **Phase 4 ✅:** FastAPI backend + React frontend integrated
+5. **Phase 5 ✅:** PostgreSQL database (Supabase)
 6. **Phase 6 ✅:** Linear model integrated from AI-models branch
+7. **Phase 7 ✅:** Leakage-free pipeline + honest per-model metrics surface (Model Performance card, rolling /model-metrics endpoint, AllStocks CNN/Linear toggle, target-date labels, past-predictions track record)
+8. **Phase 8 ✅:** Daily scheduled prediction runs (Windows Task Scheduler + scripts/daily_predict.bat)
+
+---
+
+## Recent Changes (May 2026)
+
+Feature branch `feature/session-changes-integration` lands the following on top of `main`:
+
+| Commit | What |
+|---|---|
+| `3c2bf80` | `fix(api)`: `/predictions/accuracy` actually filters by symbol + bounded limit + sorted DESC; N+1 → single `.in_()` |
+| `ee6126d` | `feat(eval)`: trading simulation (Sharpe, drawdown, PnL vs buy-and-hold) in `evaluate.py` |
+| `53f268a` | `feat(ui)`: `PastPredictionsPanel` on Stock Detail (Avg/Best/Worst + 15-row table, EN+AR) |
+| `a1d2925` | `chore`: remove `session_changes/` delivery folder after integration |
+| `61e2a28` | `refactor`: single source of truth for AI confidence in `prediction/confidence.py` |
+| `dcad0e6` | `feat(api)`: `/api/stocks` returns `model_predictions[]` + `target_date` + `history_dates`; new `/predictions/model-metrics` |
+| `1054f37` | `feat(ui)`: AllStocks CNN/Linear chip toggle + per-model card data + empty-state cards |
+| `02cadd4` | `feat(ui)`: StockDetail Model Performance card + active-model-filtered Past Predictions + target-date pills + chart x-axis dates |
+| `d5f9c6b` | `chore(ops)`: daily prediction cron via Windows Task Scheduler |
+| `f4f4fb0` | `fix`: dedupe `model_predictions` by name (keep freshest target_date); locale-safe log filename |
+
+Key behavioural changes a reviewer should know about:
+- **No more data leakage:** scaler + IQR bounds fit on training slice only; headline metrics now reported in return-space (honest CNN: MAPE 0.21%, R² 0.9961, Direction 82.74% — these are post-fix numbers).
+- **One confidence number per prediction:** `prediction.confidence.compute_confidence()` is canonical; Dashboard and Stock Detail now agree.
+- **Per-(model, symbol) accuracy scoping:** one stock's track record can no longer inflate another's confidence as Phase 3 stocks are added.
+- **User can audit the model:** Past Predictions table + Model Performance card both surface real `model_accuracy_log` data instead of relying solely on the heuristic Confidence ring.
+
+### Known follow-ups
+- Some hard-coded fallback confidence numbers may still exist in legacy frontend data; if `/api/predictions/latest` ever returns nothing those constants will surface. Verify before defence.
+- Auth has no JWT validation server-side. Routes accept `user_id` as a query param. Acceptable for a campus demo, not for anything beyond.
+- Frontend watchlist is browser-`localStorage` only; `/api/watchlist` endpoints exist but the UI isn't wired up to them.
+- Sentiment is market-wide (stored under `symbol = "TASI"`), so per-stock predictions for SABIC/STC/etc. share the same TASI sentiment score until Phase 3 sentiment-per-stock lands.
