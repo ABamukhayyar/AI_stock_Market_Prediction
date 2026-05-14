@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useId } from 'react';
 import { useLocation, useParams, useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchStock } from '../StockData';
+import { MODEL_COLORS, fetchStock, fetchAccuracy } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton } from '../components/buttons';
 import { useLanguage } from '../LanguageContext';
@@ -260,6 +260,234 @@ function ModelBadge({ model }) {
     >
       {model}
     </span>
+  );
+}
+
+// ── Past Predictions panel ──────────────────────────────────────────────
+// Calls /api/predictions/accuracy?symbol=... and renders the live track
+// record. This is the only place in the UI where the user sees the real
+// model performance (not the heuristic Signal Score / Confidence ring).
+function PastPredictionsPanel({ symbol, isDark, t }) {
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(false);
+    fetchAccuracy(symbol, 30)
+      .then((data) => {
+        if (cancelled) return;
+        setRows(Array.isArray(data) ? data : []);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setError(true);
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [symbol]);
+
+  // ── Summary stats from the loaded rows ──
+  const stats = (() => {
+    if (!rows || rows.length === 0) return null;
+    const errors = rows.map((r) => Math.abs(r.error_pct));
+    const avg = errors.reduce((a, b) => a + b, 0) / errors.length;
+    const best = rows.reduce(
+      (acc, r) => (Math.abs(r.error_pct) < Math.abs(acc.error_pct) ? r : acc),
+      rows[0],
+    );
+    const worst = rows.reduce(
+      (acc, r) => (Math.abs(r.error_pct) > Math.abs(acc.error_pct) ? r : acc),
+      rows[0],
+    );
+    return { count: rows.length, avg, best, worst };
+  })();
+
+  const errColor = (e) => {
+    const a = Math.abs(e);
+    if (a < 1) return '#22c55e';
+    if (a < 3) return '#e89a1f';
+    return '#ef4444';
+  };
+
+  return (
+    <div
+      className="stockdetail-surface"
+      style={{
+        background: isDark ? '#1e293b' : '#fff',
+        border: `1px solid ${isDark ? 'rgba(148,163,184,0.15)' : '#eef2f6'}`,
+        borderRadius: 20,
+        padding: 24,
+        marginBottom: 24,
+        boxShadow: isDark ? '0 4px 16px rgba(0,0,0,0.3)' : '0 4px 16px rgba(0,0,0,0.02)',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <h3
+            className="stockdetail-surface-title"
+            style={{ fontSize: 13, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 4 }}
+          >
+            {t('pastPredictions')}
+          </h3>
+          <p className="stockdetail-muted" style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#6b7280', margin: 0 }}>
+            {t('pastPredictionsSubtitle')}
+          </p>
+        </div>
+        {stats && (
+          <span
+            className="stockdetail-muted"
+            style={{
+              fontSize: 11,
+              color: isDark ? '#94a3b8' : '#9ca3af',
+              fontWeight: 600,
+              padding: '4px 10px',
+              border: `1px solid ${isDark ? 'rgba(148,163,184,0.2)' : '#eef2f6'}`,
+              borderRadius: 12,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {t('pastPredictionsCount', { count: stats.count })}
+          </span>
+        )}
+      </div>
+
+      {loading && (
+        <p className="stockdetail-muted" style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#6b7280', margin: '20px 0' }}>
+          {t('pastPredictionsLoading')}
+        </p>
+      )}
+
+      {!loading && error && (
+        <p style={{ fontSize: 13, color: '#ef4444', margin: '20px 0' }}>
+          {t('pastPredictionsError')}
+        </p>
+      )}
+
+      {!loading && !error && stats && (
+        <>
+          {/* Summary stats row */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+              gap: 12,
+              marginBottom: 18,
+            }}
+          >
+            <StatBox
+              label={t('avgError')}
+              value={`${stats.avg.toFixed(2)}%`}
+              accent={errColor(stats.avg)}
+              isDark={isDark}
+            />
+            <StatBox
+              label={t('bestCall')}
+              value={`${Math.abs(stats.best.error_pct).toFixed(2)}%`}
+              sub={stats.best.target_date}
+              accent="#22c55e"
+              isDark={isDark}
+            />
+            <StatBox
+              label={t('worstCall')}
+              value={`${Math.abs(stats.worst.error_pct).toFixed(2)}%`}
+              sub={stats.worst.target_date}
+              accent="#ef4444"
+              isDark={isDark}
+            />
+          </div>
+
+          {/* Table */}
+          <div style={{ overflowX: 'auto' }}>
+            <table
+              style={{
+                width: '100%',
+                borderCollapse: 'collapse',
+                fontSize: 13,
+                fontFamily: "'DM Sans', sans-serif",
+              }}
+            >
+              <thead>
+                <tr>
+                  {[t('colDate'), t('colPredicted'), t('colActual'), t('colError')].map((h) => (
+                    <th
+                      key={h}
+                      style={{
+                        textAlign: 'left',
+                        padding: '8px 10px',
+                        fontSize: 10.5,
+                        textTransform: 'uppercase',
+                        letterSpacing: 0.6,
+                        fontWeight: 700,
+                        color: isDark ? '#94a3b8' : '#6b7280',
+                        borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.2)' : '#eef2f6'}`,
+                      }}
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 15).map((r, idx) => (
+                  <tr key={`${r.target_date}-${r.model_id}-${idx}`}>
+                    <td
+                      style={{
+                        padding: '8px 10px',
+                        color: isDark ? '#e2e8f0' : '#111827',
+                        borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.08)' : '#f3f4f6'}`,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {r.target_date}
+                    </td>
+                    <td
+                      style={{
+                        padding: '8px 10px',
+                        color: isDark ? '#cbd5e1' : '#374151',
+                        borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.08)' : '#f3f4f6'}`,
+                        fontFamily: 'Georgia, serif',
+                      }}
+                    >
+                      {r.predicted_close.toFixed(2)}
+                    </td>
+                    <td
+                      style={{
+                        padding: '8px 10px',
+                        color: isDark ? '#cbd5e1' : '#374151',
+                        borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.08)' : '#f3f4f6'}`,
+                        fontFamily: 'Georgia, serif',
+                      }}
+                    >
+                      {r.actual_close.toFixed(2)}
+                    </td>
+                    <td
+                      style={{
+                        padding: '8px 10px',
+                        borderBottom: `1px solid ${isDark ? 'rgba(148,163,184,0.08)' : '#f3f4f6'}`,
+                        fontWeight: 700,
+                        color: errColor(r.error_pct),
+                      }}
+                    >
+                      {Math.abs(r.error_pct).toFixed(2)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {!loading && !error && (!rows || rows.length === 0) && (
+        <p className="stockdetail-muted" style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#6b7280', margin: '20px 0' }}>
+          {t('pastPredictionsEmpty')}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -651,6 +879,11 @@ export default function StockDetail() {
               </p>
             </div>
           </div>
+        </div>
+
+        {/* Past Predictions — live track record from /api/predictions/accuracy */}
+        <div className={`slide-up d6${mounted ? ' in' : ''}`}>
+          <PastPredictionsPanel symbol={s.id} isDark={isDark} t={t} />
         </div>
 
         <div

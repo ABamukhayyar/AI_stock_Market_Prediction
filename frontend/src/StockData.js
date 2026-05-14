@@ -49,8 +49,11 @@ export async function fetchModels() {
   return res.json();
 }
 
-export async function fetchAccuracy() {
-  const res = await fetch(`${API_BASE}/predictions/accuracy`);
+export async function fetchAccuracy(symbol, limit = 50) {
+  const params = new URLSearchParams();
+  if (symbol) params.set('symbol', symbol);
+  params.set('limit', String(limit));
+  const res = await fetch(`${API_BASE}/predictions/accuracy?${params.toString()}`);
   if (!res.ok) throw new Error('Failed to fetch accuracy');
   return res.json();
 }
