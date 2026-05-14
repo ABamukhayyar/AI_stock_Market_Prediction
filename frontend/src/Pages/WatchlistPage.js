@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton, PrimaryButton } from '../components/buttons';
 import SearchInput from '../components/SearchInput';
-import { MODEL_COLORS, fetchBatchStocks } from '../StockData';
+import { MODEL_COLORS, fetchBatchStocks, confidenceColor } from '../StockData';
 import { useLanguage } from '../LanguageContext';
 import useSmartBack from '../hooks/useSmartBack';
 import useWatchlist from '../hooks/useWatchlist';
@@ -34,7 +34,7 @@ function ConfidenceRing({ value, size = 56, animate = true, isDark = false }) {
     return () => cancelAnimationFrame(frame);
   }, [animate, value]);
 
-  const color = value >= 90 ? '#0b6343' : value >= 80 ? '#1a8a5a' : value >= 70 ? '#e89a1f' : '#d44';
+  const color = confidenceColor(value);
   const strokeDash = `${circ * (displayed / 100)} ${circ}`;
 
   return (

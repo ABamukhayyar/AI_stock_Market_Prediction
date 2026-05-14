@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useId } from 'react';
 import { useLocation, useParams, useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchStock, fetchAccuracy, fetchModelMetrics, formatTargetDate, formatTargetDateShort } from '../StockData';
+import { MODEL_COLORS, fetchStock, fetchAccuracy, fetchModelMetrics, formatTargetDate, formatTargetDateShort, confidenceColor } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton } from '../components/buttons';
 import { useLanguage } from '../LanguageContext';
@@ -26,7 +26,7 @@ function ConfidenceRing({ value, size = 72, isDark = false }) {
     return () => cancelAnimationFrame(frame);
   }, [value]);
 
-  const color = value >= 90 ? '#0b6343' : value >= 80 ? '#1a8a5a' : value >= 70 ? '#e89a1f' : '#d44';
+  const color = confidenceColor(value);
 
   return (
     <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>

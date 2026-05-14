@@ -12,6 +12,20 @@ export const MODEL_COLORS = {
 
 const API_BASE = '/api';
 
+/**
+ * Single source of truth for the AI Confidence ring color.
+ * Thresholds calibrated against the real distribution of confidence scores
+ * (most predictions land 50-70 because non-TASI stocks have no validated
+ * history yet) so we don't alarm-red the entire dashboard.
+ */
+export function confidenceColor(value) {
+  if (value >= 90) return '#0b6343';   // dark green: strong (history + signal + sentiment)
+  if (value >= 75) return '#22c55e';   // bright green: good
+  if (value >= 60) return '#e89a1f';   // amber: moderate
+  if (value >= 45) return '#64748b';   // slate: neutral (no evidence either way)
+  return '#dc6e6e';                    // muted red: genuinely weak
+}
+
 /** Format an ISO date string (YYYY-MM-DD) as "May 15, 2026" / "15 مايو 2026". */
 export function formatTargetDate(iso, lang = 'en') {
   if (!iso) return '';

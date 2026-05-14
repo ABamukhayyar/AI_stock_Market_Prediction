@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import SearchInput from '../components/SearchInput';
 import { BackButton } from '../components/buttons';
-import { MODEL_COLORS, fetchStocks, formatTargetDateShort } from '../StockData';
+import { MODEL_COLORS, fetchStocks, formatTargetDateShort, confidenceColor } from '../StockData';
 import { useLanguage } from '../LanguageContext';
 import useSmartBack from '../hooks/useSmartBack';
 import useWatchlist from '../hooks/useWatchlist';
@@ -146,7 +146,7 @@ function ConfidenceRing({ value, size = 46, animate = false, isDark = false }) {
     return () => cancelAnimationFrame(frame);
   }, [value, animate]);
 
-  const color = value >= 90 ? '#0b6343' : value >= 80 ? '#1a8a5a' : value >= 70 ? '#e89a1f' : '#d44';
+  const color = confidenceColor(value);
   const strokeDash = `${circ * (displayed / 100)} ${circ}`;
 
   return (
@@ -226,15 +226,15 @@ function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
       onMouseLeave={() => setHovered(false)}
       style={{
         background: isDark ? '#1e293b' : '#fff',
-        borderRadius: 20,
-        border: `1.5px solid ${
+        borderRadius: 18,
+        border: `1px solid ${
           hovered
             ? up
-              ? isDark ? 'rgba(34,197,94,0.35)' : 'rgba(11,99,67,0.22)'
-              : isDark ? 'rgba(239,68,68,0.35)' : 'rgba(197,48,48,0.22)'
+              ? isDark ? 'rgba(34,197,94,0.28)' : 'rgba(11,99,67,0.18)'
+              : isDark ? 'rgba(239,68,68,0.28)' : 'rgba(197,48,48,0.18)'
             : isDark
-              ? 'rgba(148,163,184,0.15)'
-              : 'rgba(0,0,0,0.07)'
+              ? 'rgba(148,163,184,0.10)'
+              : 'rgba(0,0,0,0.05)'
         }`,
         padding: '15px 15px 13px',
         display: 'flex',
@@ -242,15 +242,15 @@ function StockCard({ stock, onOpen, delay = 0, isDark, saved, onToggle }) {
         position: 'relative',
         overflow: 'hidden',
         cursor: 'pointer',
-        transition: hovered
-          ? 'box-shadow 0.2s ease, border-color 0.2s ease'
-          : 'all 0.35s cubic-bezier(0.34,1.56,0.64,1)',
-        transform: hovered ? 'translateY(-5px) scale(1.01)' : 'translateY(0)',
+        transition: 'transform 0.32s cubic-bezier(0.34,1.56,0.64,1), box-shadow 0.25s ease, border-color 0.25s ease',
+        transform: hovered ? 'translateY(-6px) scale(1.012)' : 'translateY(0)',
         boxShadow: hovered
           ? isDark
-            ? `0 18px 44px rgba(0,0,0,0.5), 0 0 0 1px ${up ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)'}`
-            : `0 18px 44px ${glow}, 0 6px 20px rgba(0,0,0,0.06)`
-          : isDark ? '0 4px 20px rgba(0,0,0,0.3)' : '0 2px 14px rgba(0,0,0,0.05)',
+            ? `0 22px 50px rgba(0,0,0,0.55), 0 8px 22px ${up ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)'}, 0 0 0 1px ${up ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)'}`
+            : `0 22px 50px ${glow}, 0 8px 22px rgba(0,0,0,0.05), 0 2px 6px rgba(0,0,0,0.03)`
+          : isDark
+            ? '0 6px 22px rgba(0,0,0,0.32), 0 1px 3px rgba(0,0,0,0.2)'
+            : '0 4px 16px rgba(15,23,42,0.045), 0 1px 3px rgba(15,23,42,0.03)',
       }}
     >
       <div

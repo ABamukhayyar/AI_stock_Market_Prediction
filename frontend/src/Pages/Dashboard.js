@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchPredictions, formatTargetDateShort } from '../StockData';
+import { MODEL_COLORS, fetchPredictions, formatTargetDateShort, confidenceColor } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import SearchInput from '../components/SearchInput';
 import { useLanguage } from '../LanguageContext';
@@ -44,7 +44,7 @@ function ConfidenceRing({ value, size = 56, animate = false, isDark = false }) {
     return () => cancelAnimationFrame(frame);
   }, [value, animate]);
 
-  const color = value >= 90 ? '#0b6343' : value >= 80 ? '#1a8a5a' : value >= 70 ? '#e89a1f' : '#d44';
+  const color = confidenceColor(value);
   const strokeDash = `${circ * (displayed / 100)} ${circ}`;
 
   return (
@@ -121,31 +121,31 @@ function StockCard({ stock, delay, isDark, saved, onToggle }) {
       onMouseMove={handleMouseMove}
       style={{
         background: isDark ? '#1e293b' : '#fff',
-        borderRadius: 20,
-        border: `1.5px solid ${
+        borderRadius: 18,
+        border: `1px solid ${
           hovered
             ? up
-              ? isDark ? 'rgba(34,197,94,0.35)' : 'rgba(11,99,67,0.22)'
-              : isDark ? 'rgba(239,68,68,0.35)' : 'rgba(197,48,48,0.22)'
+              ? isDark ? 'rgba(34,197,94,0.28)' : 'rgba(11,99,67,0.18)'
+              : isDark ? 'rgba(239,68,68,0.28)' : 'rgba(197,48,48,0.18)'
             : isDark
-              ? 'rgba(148,163,184,0.15)'
-              : 'rgba(0,0,0,0.07)'
+              ? 'rgba(148,163,184,0.10)'
+              : 'rgba(0,0,0,0.05)'
         }`,
         padding: '22px 22px 18px',
         display: 'flex', flexDirection: 'column',
         position: 'relative', overflow: 'hidden', cursor: 'pointer', zIndex: hovered ? 2 : 1,
-        transition: hovered
-          ? 'box-shadow 0.2s ease, border-color 0.2s ease'
-          : 'all 0.45s cubic-bezier(0.34,1.56,0.64,1)',
+        transition: 'transform 0.4s cubic-bezier(0.34,1.56,0.64,1), box-shadow 0.25s ease, border-color 0.25s ease, opacity 0.4s ease',
         transform: hovered
-          ? `perspective(900px) rotateX(${tilt.x}deg) rotateY(${tilt.y}deg) translateY(-7px) scale(1.015)`
+          ? `perspective(900px) rotateX(${tilt.x}deg) rotateY(${tilt.y}deg) translateY(-8px) scale(1.018)`
           : visible ? 'perspective(900px) rotateX(0) rotateY(0) translateY(0) scale(1)' : 'translateY(30px) scale(0.98)',
         opacity: visible ? 1 : 0,
         boxShadow: hovered
           ? isDark
-            ? `0 22px 64px rgba(0,0,0,0.5), 0 0 0 1px ${up ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)'}`
-            : `0 22px 64px ${glow}, 0 6px 22px rgba(0,0,0,0.07)`
-          : isDark ? '0 4px 20px rgba(0,0,0,0.3)' : '0 2px 14px rgba(0,0,0,0.05)',
+            ? `0 26px 60px rgba(0,0,0,0.55), 0 10px 24px ${up ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)'}, 0 0 0 1px ${up ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)'}`
+            : `0 26px 60px ${glow}, 0 10px 24px rgba(15,23,42,0.06), 0 2px 6px rgba(15,23,42,0.03)`
+          : isDark
+            ? '0 8px 26px rgba(0,0,0,0.32), 0 1px 3px rgba(0,0,0,0.2)'
+            : '0 4px 18px rgba(15,23,42,0.05), 0 1px 3px rgba(15,23,42,0.03)',
         transformStyle: 'flat',
       }}
     >
