@@ -87,66 +87,22 @@ def list_predictions(
 
 
 def _compute_confidence(model_id: int, predicted: float, latest_close: float,
-                        sentiment: dict = None) -> int:
-    """Compute a confidence score (0-100) for a prediction.
-
-    Based on:
-    - Model historical accuracy (from accuracy log)
-    - Signal strength (how decisive the prediction is)
-    - Sentiment alignment (does sentiment agree with prediction direction?)
+                        sentiment: dict = None, symbol: str | None = None) -> int:
+    """Adapter: map the per-row sentiment dict from sentiment_analysis to
+    the canonical scorer in prediction.confidence so Dashboard and Stock
+    Detail show the same number for the same prediction.
     """
-    sb = get_client()
-    score = 50  # base confidence
+    from prediction.confidence import compute_confidence
 
-    # 1. Historical accuracy — boost if model has been accurate
-    logs = (sb.table("model_accuracy_log")
-            .select("error_percentage,prediction_id")
-            .execute())
-    if logs.data:
-        # Get prediction IDs for this model
-        model_preds = (sb.table("ai_predictions")
-                       .select("prediction_id")
-                       .eq("model_id", model_id)
-                       .execute())
-        model_pred_ids = {p["prediction_id"] for p in (model_preds.data or [])}
-        model_errors = [l["error_percentage"] for l in logs.data
-                        if l["prediction_id"] in model_pred_ids]
-        if model_errors:
-            avg_error = sum(model_errors) / len(model_errors)
-            # Low error = high accuracy boost (0-25 points)
-            if avg_error < 1:
-                score += 25
-            elif avg_error < 2:
-                score += 20
-            elif avg_error < 5:
-                score += 12
-            elif avg_error < 10:
-                score += 5
-
-    # 2. Signal strength — stronger moves = more confident
-    if latest_close > 0:
-        change_pct = abs((predicted - latest_close) / latest_close * 100)
-        if change_pct > 2:
-            score += 15
-        elif change_pct > 1:
-            score += 10
-        elif change_pct > 0.3:
-            score += 5
-
-    # 3. Sentiment alignment — if sentiment agrees with prediction direction
-    if sentiment:
-        pred_up = predicted > latest_close
-        sent_score = sentiment.get("sentiment_score", 0)
-        sent_conf = sentiment.get("confidence", 0)
-        sent_up = sent_score > 0
-
-        if sent_conf > 50:  # only count if sentiment is confident
-            if pred_up == sent_up:
-                score += 10  # aligned
-            else:
-                score -= 5   # contradicts
-
-    return max(0, min(100, score))
+    sent = sentiment or {}
+    return compute_confidence(
+        model_id=model_id,
+        predicted_close=predicted,
+        latest_close=latest_close,
+        sentiment_score=sent.get("sentiment_score"),
+        sentiment_confidence=sent.get("confidence"),
+        symbol=symbol,
+    )
 
 
 @router.get("/latest")
@@ -199,7 +155,7 @@ def latest_predictions(symbol: str = Query(default="TASI")):
             if pred.data:
                 confidence = _compute_confidence(
                     model["model_id"], pred.data[0]["predicted_close"],
-                    latest_close, sentiment
+                    latest_close, sentiment, symbol=sym,
                 )
                 model_preds.append({
                     "predicted": pred.data[0]["predicted_close"],

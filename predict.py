@@ -382,88 +382,22 @@ def _print_result(result: dict, no_sentiment: bool = False) -> None:
     print(f"  Final Prediction:    {result['final_price']:,.2f} SAR")
 
 
-def _compute_confidence(result: dict, model_id: int | None = None) -> float:
-    """0-100 'Signal Score' for the dashboard's AI Confidence ring.
-
-    HEURISTIC, not a calibrated probability. Components:
-      - Base 50 (neutral — confidence has to be earned with evidence)
-      - Per-(symbol, model_id) historical accuracy: avg error_percentage across
-        this exact model's past validated predictions in `model_accuracy_log`.
-        Lower past error -> higher contribution. New models with no validated
-        predictions yet contribute zero — the system refuses to claim
-        confidence it has not earned.
-      - Signal strength: how decisive is the predicted move (|change %|).
-      - Sentiment alignment: does today's news agree with the prediction
-        direction? Only counted when the sentiment analysis itself is confident.
-
-    Explicitly NOT in the formula:
-      - Any model-type preference (CNN vs Linear). Preferences are not evidence;
-        the per-model accuracy lookup speaks for itself.
-
-    Parameters
-    ----------
-    result    : dict from predict_cnn / predict_linear
-    model_id  : the ai_models.model_id this prediction was registered under.
-                When provided, the historical-accuracy lookup is filtered to
-                this exact (model, symbol) pair via ai_predictions.model_id.
-                When None (or no validated rows exist yet), the historical
-                contribution is 0.
+def _compute_confidence(result: dict, model_id: int | None = None) -> int:
+    """Adapter: read fields off the predict_* result dict and call the
+    canonical scorer in prediction.confidence so the same number is used
+    everywhere the AI Confidence ring is shown.
     """
-    score = 50.0  # neutral base
+    from prediction.confidence import compute_confidence
 
-    # ---- Signal strength: bigger predicted move = more decisive ----
-    model_price = result.get("model_price", 0) or 0
-    last_close = result.get("vs", model_price) or model_price
-    if last_close and last_close > 0:
-        change_pct = abs((model_price - last_close) / last_close * 100)
-        if change_pct > 2:
-            score += 15
-        elif change_pct > 1:
-            score += 10
-        elif change_pct > 0.3:
-            score += 5
-
-    # ---- Sentiment alignment ----
     sent = result.get("sentiment", {}) or {}
-    sent_score = sent.get("score", 0) or 0
-    sent_conf = sent.get("confidence", 0) or 0
-    if sent_conf > 50:
-        pred_up = model_price > last_close if last_close else True
-        sent_up = sent_score > 0
-        score += 10 if pred_up == sent_up else -5
-
-    # ---- Per-(symbol, model_id) historical accuracy ----
-    # Filter model_accuracy_log to rows whose prediction_id was created by
-    # THIS specific model_id. Empty history -> 0 contribution (no claim).
-    if model_id is not None:
-        try:
-            from db.supabase_client import get_client
-            sb = get_client()
-            preds = (sb.table("ai_predictions")
-                       .select("prediction_id")
-                       .eq("model_id", model_id)
-                       .execute())
-            pred_ids = [p["prediction_id"] for p in (preds.data or [])]
-            if pred_ids:
-                logs = (sb.table("model_accuracy_log")
-                          .select("error_percentage")
-                          .in_("prediction_id", pred_ids)
-                          .execute())
-                rows = logs.data or []
-                if rows:
-                    avg_error = sum(r["error_percentage"] for r in rows) / len(rows)
-                    if avg_error < 0.5:
-                        score += 30
-                    elif avg_error < 1:
-                        score += 20
-                    elif avg_error < 2:
-                        score += 10
-                    elif avg_error < 5:
-                        score += 5
-        except Exception:
-            pass  # DB unreachable or row missing -> historical contribution stays 0
-
-    return max(0, min(100, round(score)))
+    return compute_confidence(
+        model_id=model_id,
+        predicted_close=result.get("model_price", 0) or 0,
+        latest_close=result.get("vs", result.get("model_price", 0)) or 0,
+        sentiment_score=sent.get("score"),
+        sentiment_confidence=sent.get("confidence"),
+        symbol=result.get("symbol"),
+    )
 
 
 def _store_prediction(result: dict, no_sentiment: bool = False) -> None:
