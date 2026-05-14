@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchPredictions } from '../StockData';
+import { MODEL_COLORS, fetchPredictions, formatTargetDateShort } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import SearchInput from '../components/SearchInput';
 import { useLanguage } from '../LanguageContext';
@@ -87,7 +87,10 @@ function StockCard({ stock, delay, isDark, saved, onToggle }) {
   const [tilt, setTilt]           = useState({ x: 0, y: 0 });
   const cardRef = useRef(null);
   const navigate = useNavigate();
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
+  const targetDate = stock.target_date
+    ? formatTargetDateShort(stock.target_date, lang)
+    : null;
 
   useEffect(() => {
     const t = setTimeout(() => setVisible(true), delay);
@@ -188,9 +191,26 @@ function StockCard({ stock, delay, isDark, saved, onToggle }) {
         </div>
       </div>
 
-      <span className="dashboard-card-muted" style={{ fontSize: 9.5, color: '#b0bac4', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.9, marginBottom: 3 }}>
-        {t('predictedClose')}
-      </span>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
+        <span className="dashboard-card-muted" style={{ fontSize: 9.5, color: '#b0bac4', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.9 }}>
+          {t('predictedClose')}
+        </span>
+        {targetDate && (
+          <span
+            style={{
+              fontSize: 10,
+              color: isDark ? '#cbd5e1' : '#475569',
+              fontWeight: 700,
+              padding: '2px 6px',
+              borderRadius: 6,
+              background: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9',
+              letterSpacing: 0.2,
+            }}
+          >
+            {t('predictedFor')} {targetDate}
+          </span>
+        )}
+      </div>
 
       {/* Price */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 5, marginBottom: 10 }}>

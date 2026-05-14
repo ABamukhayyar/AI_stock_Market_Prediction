@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useId } from 'react';
 import { useLocation, useParams, useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchStock, fetchAccuracy } from '../StockData';
+import { MODEL_COLORS, fetchStock, fetchAccuracy, fetchModelMetrics, formatTargetDate, formatTargetDateShort } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton } from '../components/buttons';
 import { useLanguage } from '../LanguageContext';
@@ -69,7 +69,7 @@ function ConfidenceRing({ value, size = 72, isDark = false }) {
   );
 }
 
-function PriceChart({ history, up, isDark = false }) {
+function PriceChart({ history, dates, up, isDark = false, lang = 'en' }) {
   const [progress, setProgress] = useState(0);
   const [totalLength, setTotalLength] = useState(0);
   const pathRef = useRef(null);
@@ -78,9 +78,12 @@ function PriceChart({ history, up, isDark = false }) {
   const clipId = `${chartId}-clip`;
 
   const series = Array.isArray(history) && history.length > 1 ? history : [history?.[0] ?? 0, history?.[0] ?? 0];
+  const dateSeries = Array.isArray(dates) && dates.length === series.length ? dates : null;
 
   const width = 600;
   const height = 160;
+  const labelGutter = dateSeries ? 24 : 0;
+  const totalHeight = height + labelGutter;
   const min = Math.min(...series);
   const max = Math.max(...series);
   const spread = max - min;
@@ -92,6 +95,23 @@ function PriceChart({ history, up, isDark = false }) {
     const y = height - ((value - (min - pad)) / denom) * height;
     return [x, y];
   });
+
+  // Pick 3 sample x-axis labels (first, middle, last) when dates are available.
+  const dateLabels = dateSeries
+    ? [0, Math.floor(dateSeries.length / 2), dateSeries.length - 1].map((i) => ({
+        x: (i / (series.length - 1)) * width,
+        text: (() => {
+          const d = new Date(dateSeries[i]);
+          if (Number.isNaN(d.getTime())) return dateSeries[i];
+          const locale = lang === 'ar' ? 'ar-SA' : 'en-US';
+          try {
+            return d.toLocaleDateString(locale, { month: 'short', day: 'numeric' });
+          } catch {
+            return dateSeries[i];
+          }
+        })(),
+      }))
+    : [];
 
   const pathD = points
     .map(([x, y], idx) => `${idx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
@@ -125,7 +145,7 @@ function PriceChart({ history, up, isDark = false }) {
   const safeLength = totalLength || 1;
 
   return (
-    <svg width="100%" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ display: 'block' }}>
+    <svg width="100%" viewBox={`0 0 ${width} ${totalHeight}`} preserveAspectRatio="none" style={{ display: 'block' }}>
       <defs>
         <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={`${areaColor}0.2)`} />
@@ -166,6 +186,24 @@ function PriceChart({ history, up, isDark = false }) {
       {points.length > 0 && progress >= safeLength * 0.9 && (
         <circle cx={points[points.length - 1][0]} cy={points[points.length - 1][1]} r="5" fill={color} stroke="white" strokeWidth="2" />
       )}
+
+      {/* X-axis date labels (first, middle, last) when dates are provided. */}
+      {dateLabels.map((d, i) => (
+        <text
+          key={`xlabel-${i}`}
+          x={i === 0 ? 4 : i === dateLabels.length - 1 ? width - 4 : d.x}
+          y={height + 16}
+          textAnchor={i === 0 ? 'start' : i === dateLabels.length - 1 ? 'end' : 'middle'}
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            fontFamily: "'DM Sans', sans-serif",
+            fill: isDark ? '#94a3b8' : '#6b7280',
+          }}
+        >
+          {d.text}
+        </text>
+      ))}
     </svg>
   );
 }
@@ -263,11 +301,125 @@ function ModelBadge({ model }) {
   );
 }
 
+// ── Model Performance card ──────────────────────────────────────────────
+// Live rolling stats for one (symbol, model_id) pair from
+// /api/predictions/model-metrics. Updates when the user toggles between
+// models in the switcher above. Empty state when the model has no
+// validated predictions yet (target dates still in the future).
+function ModelMetricsCard({ symbol, modelId, isDark, t }) {
+  const [metrics, setMetrics] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!symbol || modelId == null) {
+      setMetrics(null);
+      setLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setLoading(true);
+    fetchModelMetrics(symbol, modelId)
+      .then((data) => {
+        if (cancelled) return;
+        setMetrics(data);
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [symbol, modelId]);
+
+  const errColor = (e) => {
+    const a = Math.abs(e);
+    if (a < 1) return '#22c55e';
+    if (a < 3) return '#e89a1f';
+    return '#ef4444';
+  };
+
+  const hasData = metrics && metrics.n_predictions > 0;
+
+  return (
+    <div
+      className="stockdetail-surface"
+      style={{
+        background: isDark ? '#1e293b' : '#fff',
+        border: `1px solid ${isDark ? 'rgba(148,163,184,0.15)' : '#eef2f6'}`,
+        borderRadius: 20,
+        padding: 24,
+        marginBottom: 24,
+        boxShadow: isDark ? '0 4px 16px rgba(0,0,0,0.3)' : '0 4px 16px rgba(0,0,0,0.02)',
+      }}
+    >
+      <div style={{ marginBottom: 16 }}>
+        <h3
+          className="stockdetail-surface-title"
+          style={{ fontSize: 13, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 4 }}
+        >
+          {t('modelPerformance')}
+        </h3>
+        <p className="stockdetail-muted" style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#6b7280', margin: 0 }}>
+          {t('modelPerformanceSubtitle')}
+        </p>
+      </div>
+
+      {loading && (
+        <p className="stockdetail-muted" style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#6b7280', margin: '20px 0' }}>
+          {t('pastPredictionsLoading')}
+        </p>
+      )}
+
+      {!loading && !hasData && (
+        <p className="stockdetail-muted" style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#6b7280', margin: '20px 0' }}>
+          {t('modelMetricsEmpty')}
+        </p>
+      )}
+
+      {!loading && hasData && (
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+            gap: 12,
+          }}
+        >
+          <StatBox
+            label="MAPE"
+            value={`${metrics.mape_pct.toFixed(2)}%`}
+            accent={errColor(metrics.mape_pct)}
+            sub={`${t('bestCall')}: ${metrics.best_error_pct.toFixed(2)}%`}
+            isDark={isDark}
+          />
+          <StatBox
+            label={t('directionAccuracy')}
+            value={`${metrics.direction_accuracy_pct.toFixed(1)}%`}
+            accent={
+              metrics.direction_accuracy_pct >= 60
+                ? '#22c55e'
+                : metrics.direction_accuracy_pct >= 50
+                  ? '#e89a1f'
+                  : '#ef4444'
+            }
+            isDark={isDark}
+          />
+          <StatBox
+            label={t('validatedPredictions')}
+            value={String(metrics.n_predictions)}
+            isDark={isDark}
+          />
+          <StatBox
+            label={t('lastValidated')}
+            value={metrics.last_validated_date || '—'}
+            isDark={isDark}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Past Predictions panel ──────────────────────────────────────────────
 // Calls /api/predictions/accuracy?symbol=... and renders the live track
 // record. This is the only place in the UI where the user sees the real
 // model performance (not the heuristic Signal Score / Confidence ring).
-function PastPredictionsPanel({ symbol, isDark, t }) {
+function PastPredictionsPanel({ symbol, modelId, isDark, t }) {
   const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
@@ -290,20 +442,26 @@ function PastPredictionsPanel({ symbol, isDark, t }) {
     return () => { cancelled = true; };
   }, [symbol]);
 
+  // Filter to the currently-selected model when one is provided so the
+  // panel matches the model the user is looking at on this page.
+  const filteredRows = modelId != null && rows
+    ? rows.filter((r) => r.model_id === modelId)
+    : rows;
+
   // ── Summary stats from the loaded rows ──
   const stats = (() => {
-    if (!rows || rows.length === 0) return null;
-    const errors = rows.map((r) => Math.abs(r.error_pct));
+    if (!filteredRows || filteredRows.length === 0) return null;
+    const errors = filteredRows.map((r) => Math.abs(r.error_pct));
     const avg = errors.reduce((a, b) => a + b, 0) / errors.length;
-    const best = rows.reduce(
+    const best = filteredRows.reduce(
       (acc, r) => (Math.abs(r.error_pct) < Math.abs(acc.error_pct) ? r : acc),
-      rows[0],
+      filteredRows[0],
     );
-    const worst = rows.reduce(
+    const worst = filteredRows.reduce(
       (acc, r) => (Math.abs(r.error_pct) > Math.abs(acc.error_pct) ? r : acc),
-      rows[0],
+      filteredRows[0],
     );
-    return { count: rows.length, avg, best, worst };
+    return { count: filteredRows.length, avg, best, worst };
   })();
 
   const errColor = (e) => {
@@ -432,7 +590,7 @@ function PastPredictionsPanel({ symbol, isDark, t }) {
                 </tr>
               </thead>
               <tbody>
-                {rows.slice(0, 15).map((r, idx) => (
+                {filteredRows.slice(0, 15).map((r, idx) => (
                   <tr key={`${r.target_date}-${r.model_id}-${idx}`}>
                     <td
                       style={{
@@ -482,7 +640,7 @@ function PastPredictionsPanel({ symbol, isDark, t }) {
         </>
       )}
 
-      {!loading && !error && (!rows || rows.length === 0) && (
+      {!loading && !error && (!filteredRows || filteredRows.length === 0) && (
         <p className="stockdetail-muted" style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#6b7280', margin: '20px 0' }}>
           {t('pastPredictionsEmpty')}
         </p>
@@ -493,7 +651,7 @@ function PastPredictionsPanel({ symbol, isDark, t }) {
 
 export default function StockDetail() {
   const { isDark } = useTheme();
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   const { id } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
@@ -532,6 +690,7 @@ export default function StockDetail() {
       trend: activeModel.trend,
       model: activeModel.model_name,
       confidence: activeModel.confidence,
+      target_date: activeModel.target_date,
     } : {}),
   } : null;
 
@@ -637,7 +796,7 @@ export default function StockDetail() {
 
         {/* Model Switcher */}
         {modelPredictions.length > 1 && (
-          <div className={`slide-up d1${mounted ? ' in' : ''}`} style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
+          <div className={`slide-up d1${mounted ? ' in' : ''}`} style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
             {modelPredictions.map((mp, idx) => {
               const isActive = idx === activeModelIdx;
               const mpUp = mp.trend === 'up';
@@ -670,6 +829,15 @@ export default function StockDetail() {
               );
             })}
           </div>
+        )}
+
+        {activeModel && (
+          <ModelMetricsCard
+            symbol={s.id}
+            modelId={activeModel.model_id}
+            isDark={isDark}
+            t={t}
+          />
         )}
 
         <div className={`slide-up d1${mounted ? ' in' : ''}`} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 28 }}>
@@ -740,6 +908,27 @@ export default function StockDetail() {
             <p className="stockdetail-muted" style={{ fontSize: 12, color: '#9ca3af', marginTop: 6 }}>
               {t('predictedCloseVs', { value: (s.vs ?? 0).toFixed(2) })}
             </p>
+            {s.target_date && (
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  marginTop: 8,
+                  padding: '5px 12px',
+                  borderRadius: 999,
+                  background: isDark ? 'rgba(148,163,184,0.14)' : '#eef2f6',
+                  border: `1px solid ${isDark ? 'rgba(148,163,184,0.25)' : '#d1d5db'}`,
+                }}
+              >
+                <span style={{ fontSize: 10, fontWeight: 800, color: isDark ? '#94a3b8' : '#6b7280', textTransform: 'uppercase', letterSpacing: 0.7 }}>
+                  {t('predictedFor')}
+                </span>
+                <span style={{ fontSize: 13, fontWeight: 700, color: isDark ? '#f1f5f9' : '#111827' }}>
+                  {formatTargetDate(s.target_date, lang)}
+                </span>
+              </div>
+            )}
             <div style={{ marginTop: 16 }}>
               <WatchlistButton
                 active={isSaved(s.id)}
@@ -793,7 +982,13 @@ export default function StockDetail() {
               ))}
             </div>
           </div>
-          <PriceChart history={s.history} up={up} isDark={isDark} />
+          <PriceChart
+            history={s.history}
+            dates={s.history_dates}
+            up={up}
+            isDark={isDark}
+            lang={lang}
+          />
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10, padding: '0 4px' }}>
             <span className="stockdetail-muted" style={{ fontSize: 10.5, color: '#9ca3af' }}>
               {t('daysAgo14')}
@@ -883,7 +1078,12 @@ export default function StockDetail() {
 
         {/* Past Predictions — live track record from /api/predictions/accuracy */}
         <div className={`slide-up d6${mounted ? ' in' : ''}`}>
-          <PastPredictionsPanel symbol={s.id} isDark={isDark} t={t} />
+          <PastPredictionsPanel
+            symbol={s.id}
+            modelId={activeModel ? activeModel.model_id : null}
+            isDark={isDark}
+            t={t}
+          />
         </div>
 
         <div
