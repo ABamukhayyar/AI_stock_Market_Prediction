@@ -685,7 +685,12 @@ export default function AllStocks() {
               padding: '6px 12px',
             }}
           >
-            <span style={{ fontSize: 12, color: '#fff', fontWeight: 800 }}>{sortMode === 'gainers' ? 'UP' : 'DN'}</span>
+            <span
+              aria-label={sortMode === 'gainers' ? 'Up' : 'Down'}
+              style={{ fontSize: 12, color: '#fff', fontWeight: 800 }}
+            >
+              {sortMode === 'gainers' ? 'UP' : 'DN'}
+            </span>
             <span style={{ fontSize: 11.5, color: 'rgba(255,255,255,0.92)', fontWeight: 700, letterSpacing: 0.2 }}>
               {orderingText}
             </span>

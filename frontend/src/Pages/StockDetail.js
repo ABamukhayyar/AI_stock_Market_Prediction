@@ -4,9 +4,9 @@ import { MODEL_COLORS, fetchStock, fetchAccuracy, fetchModelMetrics, formatTarge
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton } from '../components/buttons';
 import { useLanguage } from '../LanguageContext';
-import useSmartBack from '../hooks/useSmartBack';
 import useWatchlist from '../hooks/useWatchlist';
 import WatchlistButton from '../components/WatchlistButton';
+import StatBox from '../components/StatBox';
 
 function ConfidenceRing({ value, size = 72, isDark = false }) {
   const radius = size / 2 - 6;
@@ -208,53 +208,6 @@ function PriceChart({ history, dates, up, isDark = false, lang = 'en' }) {
   );
 }
 
-function StatBox({ label, value, sub, accent, isDark = false }) {
-  return (
-    <div
-      className="stockdetail-stat"
-      style={{
-        background: isDark ? '#111827' : '#f9fafb',
-        border: `1px solid ${isDark ? 'rgba(148,163,184,0.22)' : '#eef2f6'}`,
-        borderRadius: 14,
-        padding: '16px 20px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 4,
-      }}
-    >
-      <span
-        className="stockdetail-muted"
-        style={{
-          fontSize: 10,
-          color: isDark ? '#94a3b8' : '#6b7280',
-          fontWeight: 700,
-          textTransform: 'uppercase',
-          letterSpacing: 0.8,
-        }}
-      >
-        {label}
-      </span>
-      <span
-        className="stockdetail-stat-value"
-        style={{
-          fontSize: 20,
-          fontWeight: 800,
-          color: accent || (isDark ? '#f8fafc' : '#111827'),
-          letterSpacing: '-0.3px',
-          fontFamily: 'Georgia, serif',
-        }}
-      >
-        {value}
-      </span>
-      {sub && (
-        <span className="stockdetail-muted" style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#9ca3af' }}>
-          {sub}
-        </span>
-      )}
-    </div>
-  );
-}
-
 function PriceLabel({ label, value, isDark = false }) {
   return (
     <div
@@ -376,7 +329,7 @@ function ModelMetricsCard({ symbol, modelId, isDark, t, onOpenDiagnostics }) {
               whiteSpace: 'nowrap',
             }}
           >
-            View Diagnostics →
+            {t('viewDiagnostics')}
           </button>
         )}
       </div>
@@ -685,7 +638,12 @@ export default function StockDetail() {
       : location.state?.from === '/watchlist'
         ? '/watchlist'
         : '/stocks';
-  const goBack = useSmartBack(fromPage);
+  // Deterministic back -- always navigate to the resolved fromPage rather
+  // than rely on browser history. useSmartBack was popping the history
+  // stack, which broke the round-trip when the user had visited
+  // /stock/:id/diagnostics from this page (they ended up on Diagnostics
+  // instead of /stocks /dashboard /watchlist). See plan for details.
+  const goBack = () => navigate(fromPage);
 
   const [stock, setStock] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -858,7 +816,7 @@ export default function StockDetail() {
             modelId={activeModel.model_id}
             isDark={isDark}
             t={t}
-            onOpenDiagnostics={() => navigate(`/stock/${s.id}/diagnostics`)}
+            onOpenDiagnostics={() => navigate(`/stock/${s.id}/diagnostics`, { state: { from: fromPage } })}
           />
         )}
 
