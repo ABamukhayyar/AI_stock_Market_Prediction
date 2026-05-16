@@ -3,14 +3,15 @@ venv/
 __pycache__/
 *.pyc
 
-# Trained model artefacts (regenerable; large)
-models/*.keras
-models/*.pkl
-models/*.png
+# Trained model artefacts
+# Small per-symbol weights (~12 MB total) and eval metrics ARE checked in
+# so teammates can clone-and-run without retraining. Only the huge
+# auto-downloaded HuggingFace caches and regenerable plots are ignored.
 models/finbert/
 models/opus-mt-ar-en/
-models/eval_v4/
+models/*.png
 models/plots/
+models/eval_v4/*.png
 
 # Secrets / credentials
 .env

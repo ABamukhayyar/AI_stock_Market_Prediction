@@ -18,7 +18,7 @@ news.
 cd Grap_Project_Insight
 
 # 2. Set credentials
-copy .env.example .env    # then fill in SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_KEY
+# Get the .env file from Abdullah (Supabase keys aren't in the repo) and drop it in the project root.
 
 # 3. Backend deps
 pip install -r requirements.txt
