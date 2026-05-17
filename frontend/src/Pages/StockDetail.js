@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useId } from 'react';
 import { useLocation, useParams, useNavigate } from 'react-router-dom';
-import { MODEL_COLORS, fetchStock, fetchAccuracy, fetchModelMetrics, formatTargetDate, formatTargetDateShort, confidenceColor } from '../StockData';
+import { MODEL_COLORS, fetchStock, fetchStockHistory, fetchAccuracy, fetchModelMetrics, formatTargetDate, formatTargetDateShort, confidenceColor } from '../StockData';
 import Layout, { MarketStatus, useTheme } from '../components/Layout';
 import { BackButton } from '../components/buttons';
 import { useLanguage } from '../LanguageContext';
@@ -648,14 +648,30 @@ export default function StockDetail() {
   const [stock, setStock] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeModelIdx, setActiveModelIdx] = useState(0);
+  const [historyRows, setHistoryRows] = useState(null);
+  const [activeRange, setActiveRange] = useState('2W');
 
   useEffect(() => {
     setLoading(true);
     setActiveModelIdx(0);
+    setHistoryRows(null);
+    setActiveRange('2W');
     fetchStock(id)
       .then(data => { setStock(data); setLoading(false); })
       .catch(() => setLoading(false));
+    fetchStockHistory(id, 30)
+      .then((rows) => setHistoryRows(Array.isArray(rows) ? rows : []))
+      .catch(() => setHistoryRows([]));
   }, [id]);
+
+  const RANGE_LENGTH = { '1W': 7, '2W': 14, '1M': 30 };
+  const slicedHistory = (() => {
+    const rows = historyRows ?? [];
+    const n = RANGE_LENGTH[activeRange] ?? rows.length;
+    return rows.slice(-n);
+  })();
+  const chartCloses = slicedHistory.map((r) => r.close);
+  const chartDates = slicedHistory.map((r) => r.date);
 
   // Get the active model's prediction (if multiple models available)
   const modelPredictions = stock?.model_predictions || [];
@@ -672,8 +688,6 @@ export default function StockDetail() {
       target_date: activeModel.target_date,
     } : {}),
   } : null;
-
-  const otherStocks = [];
 
   useEffect(() => {
     const timeout = setTimeout(() => setMounted(true), 60);
@@ -942,36 +956,41 @@ export default function StockDetail() {
               {t('priceHistory')}
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
-              {['1W', '2W', '1M'].map((timeframe, idx) => (
-                <button
-                  key={timeframe}
-                  className={`stockdetail-timeframe-btn${idx === 1 ? ' active' : ''}`}
-                  style={{
-                    background: idx === 1 ? '#0b6343' : 'transparent',
-                    border: `1px solid ${idx === 1 ? (isDark ? 'rgba(34,197,94,0.5)' : '#0b6343') : (isDark ? 'rgba(148,163,184,0.3)' : '#d1d5db')}`,
-                    color: idx === 1 ? '#fff' : (isDark ? '#cbd5e1' : '#4b5563'),
-                    borderRadius: 20,
-                    padding: '3px 10px',
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {timeframe}
-                </button>
-              ))}
+              {['1W', '2W', '1M'].map((timeframe) => {
+                const isActive = activeRange === timeframe;
+                return (
+                  <button
+                    key={timeframe}
+                    type="button"
+                    onClick={() => setActiveRange(timeframe)}
+                    className={`stockdetail-timeframe-btn${isActive ? ' active' : ''}`}
+                    style={{
+                      background: isActive ? '#0b6343' : 'transparent',
+                      border: `1px solid ${isActive ? (isDark ? 'rgba(34,197,94,0.5)' : '#0b6343') : (isDark ? 'rgba(148,163,184,0.3)' : '#d1d5db')}`,
+                      color: isActive ? '#fff' : (isDark ? '#cbd5e1' : '#4b5563'),
+                      borderRadius: 20,
+                      padding: '3px 10px',
+                      fontSize: 11,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {timeframe}
+                  </button>
+                );
+              })}
             </div>
           </div>
           <PriceChart
-            history={s.history}
-            dates={s.history_dates}
+            history={chartCloses.length > 0 ? chartCloses : s.history}
+            dates={chartDates.length > 0 ? chartDates : s.history_dates}
             up={up}
             isDark={isDark}
             lang={lang}
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10, padding: '0 4px' }}>
             <span className="stockdetail-muted" style={{ fontSize: 10.5, color: '#9ca3af' }}>
-              {t('daysAgo14')}
+              {(chartCloses.length > 0 ? chartCloses.length : 14) + ' ' + t('daysAgoSuffix')}
             </span>
             <span className="stockdetail-muted" style={{ fontSize: 10.5, color: '#9ca3af' }}>
               {t('todayPredicted')}
@@ -984,8 +1003,6 @@ export default function StockDetail() {
           <StatBox label={t('dayHigh')} value={(s.high ?? 0).toFixed(2)} sub="SAR" accent={up ? '#22c55e' : undefined} isDark={isDark} />
           <StatBox label={t('dayLow')} value={(s.low ?? 0).toFixed(2)} sub="SAR" accent={!up ? '#ef4444' : undefined} isDark={isDark} />
           <StatBox label={t('volume')} value={s.volume || 'N/A'} sub={t('sharesTraded')} isDark={isDark} />
-          <StatBox label={t('marketCap')} value={`SAR ${s.marketCap || 'N/A'}`} sub={t('totalValue')} isDark={isDark} />
-          <StatBox label={t('peRatio')} value={s.pe != null ? s.pe.toFixed(1) : 'N/A'} sub={t('priceEarnings')} isDark={isDark} />
           <StatBox label={t('week52High')} value={(s.week52High ?? 0).toFixed(2)} sub="SAR" isDark={isDark} />
           <StatBox label={t('week52Low')} value={(s.week52Low ?? 0).toFixed(2)} sub="SAR" isDark={isDark} />
         </div>
@@ -1066,49 +1083,6 @@ export default function StockDetail() {
           />
         </div>
 
-        <div
-          className={`slide-up d6 stockdetail-surface${mounted ? ' in' : ''}`}
-          style={{ background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? 'rgba(148,163,184,0.15)' : '#eef2f6'}`, borderRadius: 20, padding: 24, boxShadow: isDark ? '0 4px 16px rgba(0,0,0,0.3)' : '0 4px 16px rgba(0,0,0,0.02)' }}
-        >
-          <h3 className="stockdetail-surface-title" style={{ fontSize: 13, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: 0.7, marginBottom: 16 }}>
-            {t('otherPredictions')}
-          </h3>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-            {otherStocks.map((item) => {
-              const isUp = item.trend === 'up';
-              return (
-                <button
-                  key={item.id}
-                  className="stock-nav-btn stockdetail-nav-btn"
-                  onClick={() => navigate(`/stock/${item.id}`, { state: { from: fromPage } })}
-                  style={{
-                    background: 'transparent',
-                    border: `1px solid ${isDark ? 'rgba(148,163,184,0.15)' : '#eef2f6'}`,
-                    borderRadius: 12,
-                    padding: '10px 16px',
-                    cursor: 'pointer',
-                    transition: 'background 0.18s',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 3,
-                    alignItems: 'flex-start',
-                  }}
-                >
-                  <span className="stockdetail-muted" style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, letterSpacing: 0.8 }}>
-                    {item.id}
-                  </span>
-                  <span className="stockdetail-nav-name" style={{ fontSize: 13, fontWeight: 800, color: '#111827' }}>
-                    {item.name}
-                  </span>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: isUp ? '#22c55e' : '#ef4444' }}>
-                    {isUp ? '+' : '-'}
-                    {Math.abs(item.change).toFixed(2)}%
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
       </div>
     </Layout>
   );
