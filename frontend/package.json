@@ -9,7 +9,6 @@
     "react-dom": "^18.2.0",
     "react-hook-form": "^7.72.1",
     "react-hot-toast": "^2.4.1",
-    "react-phone-number-input": "^3.3.9",
     "react-router-dom": "^6.20.0",
     "react-scripts": "5.0.1",
     "react-scroll-to-top": "^3.0.0",

@@ -18,3 +18,4 @@ lxml>=5.1.0
 sentencepiece>=0.2.0
 statsmodels>=0.14.0
 seaborn>=0.13.0
+bcrypt>=4.0.0

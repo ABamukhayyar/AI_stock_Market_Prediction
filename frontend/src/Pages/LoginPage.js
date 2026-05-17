@@ -5,7 +5,7 @@ import { TASI_ALL_STOCKS_BY_ID } from '../data/tasiAllStocks';
 import { PrimaryButton } from '../components/buttons';
 import { useTheme } from '../components/Layout';
 import { useLanguage } from '../LanguageContext';
-import { createDemoUser, setStoredUser } from '../utils/auth';
+import { setStoredUser } from '../utils/auth';
 import ThemeToggleButton from '../components/ThemeToggleButton';
 
 const TICKER_ALIAS = {
@@ -222,6 +222,7 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [error, setError] = useState(null); // { kind: 'account_not_found' | 'invalid_password' | 'server' }
   const [tickers, setTickers] = useState(TASI_TICKERS);
   const navigate = useNavigate();
   const location = useLocation();
@@ -252,22 +253,48 @@ export default function LoginPage() {
   const fu = (...cls) => ['fade-up', ...cls, mounted && 'visible'].filter(Boolean).join(' ');
 
   const handleLogin = useCallback(
-    (event) => {
+    async (event) => {
       event.preventDefault();
       if (!isReady || loading) return;
+      setError(null);
       setLoading(true);
-      setTimeout(() => {
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email.trim(), password }),
+        });
+
+        if (res.ok) {
+          const user = await res.json();
+          setStoredUser(user);
+          setSuccess(true);
+          setTimeout(() => navigate(redirectTo), 500);
+          return;
+        }
+
+        let detail = null;
+        try {
+          const body = await res.json();
+          detail = body?.detail;
+        } catch {
+          // ignore parse failure -- fall through to server error
+        }
+
+        if (res.status === 404 && detail === 'account_not_found') {
+          setError({ kind: 'account_not_found' });
+        } else if (res.status === 401 && detail === 'invalid_password') {
+          setError({ kind: 'invalid_password' });
+        } else {
+          setError({ kind: 'server' });
+        }
+      } catch {
+        setError({ kind: 'server' });
+      } finally {
         setLoading(false);
-        setSuccess(true);
-        setStoredUser(
-          createDemoUser({
-            email: email.trim() || 'ahmed@example.com',
-          })
-        );
-        setTimeout(() => navigate(redirectTo), 600);
-      }, 1800);
+      }
     },
-    [email, isReady, loading, navigate, redirectTo]
+    [email, password, isReady, loading, navigate, redirectTo]
   );
 
   const handleCreateAccount = useCallback(() => navigate('/signup'), [navigate]);
@@ -466,7 +493,7 @@ export default function LoginPage() {
 
               <form onSubmit={handleLogin} noValidate style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
                 <div className={fu('delay-2')}>
-                  <FloatingInput id="email" type="email" label={t('emailAddress')} value={email} onChange={(e) => setEmail(e.target.value)} isDark={isDark} isRTL={isRTL} />
+                  <FloatingInput id="email" type="email" label={t('emailAddress')} value={email} onChange={(e) => { setEmail(e.target.value); if (error) setError(null); }} isDark={isDark} isRTL={isRTL} />
                 </div>
 
                 <div className={fu('delay-3')}>
@@ -475,7 +502,7 @@ export default function LoginPage() {
                     type={showPassword ? 'text' : 'password'}
                     label={t('password')}
                     value={password}
-                    onChange={(e) => setPassword(e.target.value)}
+                    onChange={(e) => { setPassword(e.target.value); if (error) setError(null); }}
                     isPassword
                     showPassword={showPassword}
                     onToggleShow={() => setShowPassword((prev) => !prev)}
@@ -485,6 +512,51 @@ export default function LoginPage() {
                     hideLabel={t('hidePassword')}
                   />
                 </div>
+
+                {error && (
+                  <div
+                    role="alert"
+                    style={{
+                      marginBottom: 16,
+                      padding: '12px 14px',
+                      borderRadius: 12,
+                      background: isDark ? 'rgba(239,68,68,0.08)' : 'rgba(239,68,68,0.06)',
+                      border: '1px solid rgba(239,68,68,0.25)',
+                      color: '#ef4444',
+                      fontSize: 13,
+                      lineHeight: 1.5,
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: 6,
+                    }}
+                  >
+                    {error.kind === 'account_not_found' && (
+                      <>
+                        <span>{t('loginErrorAccountNotFound')}</span>
+                        <button
+                          type="button"
+                          onClick={handleCreateAccount}
+                          style={{ background: 'none', border: 'none', padding: 0, color: '#ef4444', fontWeight: 700, textDecoration: 'underline', cursor: 'pointer', fontSize: 13 }}
+                        >
+                          {t('loginErrorAccountNotFoundCta')}
+                        </button>
+                      </>
+                    )}
+                    {error.kind === 'invalid_password' && (
+                      <>
+                        <span>{t('loginErrorWrongPassword')}</span>
+                        <button
+                          type="button"
+                          onClick={handleForgotPassword}
+                          style={{ background: 'none', border: 'none', padding: 0, color: '#ef4444', fontWeight: 700, textDecoration: 'underline', cursor: 'pointer', fontSize: 13 }}
+                        >
+                          {t('loginErrorWrongPasswordCta')}
+                        </button>
+                      </>
+                    )}
+                    {error.kind === 'server' && <span>{t('loginErrorServer')}</span>}
+                  </div>
+                )}
 
                 <div
                   className={fu('delay-3')}

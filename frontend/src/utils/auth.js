@@ -26,12 +26,3 @@ export function clearStoredUser() {
   if (typeof window === 'undefined') return;
   window.localStorage.removeItem(AUTH_STORAGE_KEY);
 }
-
-export function createDemoUser(overrides = {}) {
-  return {
-    id: 'demo-user',
-    fullName: 'Ahmed Al-Rashidi',
-    email: 'ahmed@example.com',
-    ...overrides,
-  };
-}
