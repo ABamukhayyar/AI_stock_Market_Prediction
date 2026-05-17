@@ -353,6 +353,10 @@ Feature branch `feature/session-changes-integration` lands the following on top 
 | `874822f` | `feat(eval)`: non-TASI metrics + cost-adjusted (10 bps) Sharpe alongside headline + clearer equity-curve explainer |
 | `1b05da0` | `style(ui)`: calibrated confidence palette (50% now neutral slate, not alarm-red) + softer card borders + better hover shadows |
 | `773908e` | `feat(ops)`: daily refresh now covers all 6 stocks, not just TASI |
+| `14cec39` | `chore(repo)`: ship trained models + eval metrics so teammates clone-and-run |
+| `3607e20` | `fix(ops+db)`: refresh non-TASI tickers daily (`source="auto"` for all symbols); `insert_prediction` is now an upsert on `(model_id, symbol, target_date)`; new `scripts/dedupe_predictions.py` one-shot cleanup |
+| `1da3b34` | `refactor(ui)`: dropped fake Settings controls (password modal, notification toggles, 2FA, export) + Profile MOCK_USER + StockDetail's empty "Other Predictions" + `marketCap`/`peRatio` N/A tiles; wired the 1W/2W/1M chart buttons against `/stocks/{id}/history?days=30` |
+| `507b337` | `feat(auth)`: real bcrypt login + signup against the `users` table; LoginPage shows inline errors for `account_not_found` / `invalid_password` / server; SignUp is a single-step form (no OTP / phone wizard); requires one-time `ALTER TABLE users ADD COLUMN password_hash` |
 
 Key behavioural changes a reviewer should know about:
 - **No more data leakage:** scaler + IQR bounds fit on training slice only; headline metrics now reported in return-space (honest CNN: MAPE 0.21%, R² 0.9961, Direction 82.74% — these are post-fix numbers).
@@ -363,11 +367,14 @@ Key behavioural changes a reviewer should know about:
 - **Honest Sharpe:** every Diagnostics page shows both the headline (zero-cost) and 10-bps round-trip realistic Sharpe. The CNN's edge survives 10 bps; some Linear baselines go negative after costs — the asymmetry is itself the defence answer to "are these numbers real?".
 - **Calibrated colors:** the AI Confidence ring is no longer alarm-red for any score below 70. 50% is now slate (neutral, no evidence either way), matching the system's actual epistemic state when validated history is sparse.
 - **All 6 stocks daily:** the cron now refreshes ARAMCO/RAJHI/SABIC/STC/SECO alongside TASI, not just TASI.
+- **Real auth:** the login form is no longer a `setTimeout` that accepts anything — it `POST`s to `/api/auth/login`, bcrypt-verifies against the `users` table, and renders distinct inline errors for unknown email / wrong password / server unreachable. SignUp is a real single-step form against the same table (no OTP / phone wizard).
+- **No more prediction duplicates:** `insert_prediction` is now an upsert keyed on `(model_id, symbol, target_date)`, so reruns of `predict.py` overwrite the prior row instead of stacking. The Past Predictions panel no longer shows N copies of the same date per model. `scripts/dedupe_predictions.py` cleaned up the legacy duplicates one-shot.
+- **Honest UI:** every Settings toggle and Profile field that didn't actually persist anywhere has been removed (no more password-change modal, notification toggles, Export Data button, MOCK_USER phone). The 1W/2W/1M chart buttons on Stock Detail actually filter now.
 
 ### Known follow-ups
 - Some hard-coded fallback confidence numbers may still exist in legacy frontend data; if `/api/predictions/latest` ever returns nothing those constants will surface. Verify before defence.
-- Auth has no JWT validation server-side. Routes accept `user_id` as a query param. Acceptable for a campus demo, not for anything beyond.
+- **No JWT / session tokens.** Login returns the user profile and the frontend stores it in localStorage. Routes that take `user_id` accept it as a query param without server-side validation. Acceptable for a campus demo, not for anything beyond.
 - Frontend watchlist is browser-`localStorage` only; `/api/watchlist` endpoints exist but the UI isn't wired up to them.
 - **Sentiment is market-wide** (stored under `symbol = "TASI"`), so per-stock predictions for SABIC/STC/etc. share the same TASI sentiment score until Phase 3 sentiment-per-stock lands. Non-TASI cards always show "Neutral" sentiment as a result.
-- **`market_data` may have gaps** for non-TASI symbols on recently-passed dates. When `_check_past_predictions_accuracy()` can't find the actual close for a (symbol, target_date), it silently skips, so non-TASI rolling metrics stay at zero validated predictions. Worth a `[WARN]` log + backfill follow-up so the Model Performance card populates for those stocks.
+- **No password reset flow.** The ForgotPassword page exists but stays cosmetic. The login error "Forgot password?" CTA links to it.
 - **No walk-forward backtest.** The 88% direction accuracy on TASI CNN is one realisation on a single 586-day holdout. A walk-forward backtest (train on years 1–5, test on year 6, slide forward) would give a more defensible generalisation claim. Not in scope for the current iteration but flagged as a future-work item.
