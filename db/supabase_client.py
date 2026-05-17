@@ -228,7 +228,16 @@ def insert_prediction(
     used_technical: bool = True,
     input_features: str = "",
 ) -> int:
-    """Insert a prediction row. Returns prediction_id."""
+    """Upsert a prediction row keyed on (model_id, symbol, target_date).
+
+    A plain insert produced one new row per predict.py invocation, so any
+    re-run (cron retry, manual debugging) accumulated duplicate predictions
+    for the same target day — which then inflated the Past Predictions panel
+    with N copies of the same date. Now: if a row already exists for this
+    (model_id, symbol, target_date), it is updated in place with the fresher
+    prediction and the same prediction_id is returned. Latest-rerun-wins is
+    the right semantic — a later run has fresher inputs.
+    """
     sb = get_client()
     row = {
         "model_id": model_id,
@@ -242,6 +251,20 @@ def insert_prediction(
         "used_technical_indicators": used_technical,
         "input_features": input_features,
     }
+    existing = (
+        sb.table("ai_predictions")
+        .select("prediction_id")
+        .eq("model_id", model_id)
+        .eq("symbol", symbol)
+        .eq("target_date", target_date)
+        .execute()
+    )
+    if existing.data:
+        prediction_id = existing.data[0]["prediction_id"]
+        sb.table("ai_predictions").update(row).eq(
+            "prediction_id", prediction_id
+        ).execute()
+        return prediction_id
     result = sb.table("ai_predictions").insert(row).execute()
     return result.data[0]["prediction_id"]
 

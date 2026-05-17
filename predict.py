@@ -167,10 +167,14 @@ def predict_cnn(
     model_path = model_path or info["cnn_model_path"]
     scaler_path = scaler_path or info["cnn_scaler_path"]
 
-    # 1. Load data — TASI from yfinance/CSV+macro, others from Supabase+macro
+    # 1. Load data — refresh yfinance → Supabase, then merge with macro.
+    # Every symbol uses "auto" so the daily cron actually updates non-TASI
+    # tickers; gating on `symbol == "TASI"` left ARAMCO/RAJHI/SABIC/STC/SECO
+    # frozen at whatever was last in Supabase and produced predictions for
+    # a target_date in the past.
     das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
                                   ticker=info["yfinance_ticker"])
-    df = das.load_all(source="auto" if symbol == "TASI" else "supabase")
+    df = das.load_all(source="auto")
     last_data_date = df["Date"].max().strftime("%Y-%m-%d")
 
     # 1b. Fetch live sentiment and merge
@@ -284,10 +288,10 @@ def predict_linear(
     model_path = model_path or info["linear_model_path"]
     scaler_path = scaler_path or info["linear_scaler_path"]
 
-    # 1. Load data via the existing pipeline (source depends on symbol)
+    # 1. Load data via the existing pipeline (refresh yfinance for every symbol)
     das = DataAcquisitionService(csv_path=csv_path, symbol=symbol,
                                   ticker=info["yfinance_ticker"])
-    df = das.load_all(source="auto" if symbol == "TASI" else "supabase")
+    df = das.load_all(source="auto")
     last_data_date = df["Date"].max().strftime("%Y-%m-%d")
 
     # 1b. Sentiment (for post-prediction adjustment, not a model feature)
